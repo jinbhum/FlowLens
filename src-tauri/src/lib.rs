@@ -48,8 +48,9 @@ fn windows_active_window() -> String {
 
 #[cfg(windows)]
 fn start_windows_tracker(state: Arc<Mutex<TrackingState>>) {
-    use windows::Win32::Foundation::{GetCursorPos, POINT};
+    use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     thread::spawn(move || {
         let mut previous_window = String::new();
         let mut previous_cursor = POINT { x: 0, y: 0 };
