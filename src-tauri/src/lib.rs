@@ -37,9 +37,10 @@ fn capture_snapshot(state: tauri::State<'_, Arc<Mutex<TrackingState>>>) -> Resul
 
 #[cfg(windows)]
 fn windows_active_window() -> String {
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
     let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.0 == 0 { return String::new(); }
+    if hwnd == HWND::default() { return String::new(); }
     let mut buffer = [0u16; 512];
     let len = unsafe { GetWindowTextW(hwnd, &mut buffer) };
     String::from_utf16_lossy(&buffer[..len as usize])
@@ -47,7 +48,8 @@ fn windows_active_window() -> String {
 
 #[cfg(windows)]
 fn start_windows_tracker(state: Arc<Mutex<TrackingState>>) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetCursorPos, POINT};
+    use windows::Win32::Foundation::{GetCursorPos, POINT};
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     thread::spawn(move || {
         let mut previous_window = String::new();
         let mut previous_cursor = POINT { x: 0, y: 0 };
