@@ -613,10 +613,10 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                     if !idle && current.current_session_started_at.is_none() {
                         current.resume_latency_seconds = current.last_input_age_seconds;
                         current.current_session_started_at = Some(now.to_rfc3339());
-                        record_event(&mut current, now.to_rfc3339(), active_app.clone(), active_app, "session_start");
+                        record_event(&mut current, now.to_rfc3339(), active_app.clone(), active_app.clone(), "session_start");
                     }
                     if idle && current.current_session_started_at.is_some() {
-                        record_event(&mut current, now.to_rfc3339(), active_app.clone(), active_app, "session_end_idle");
+                        record_event(&mut current, now.to_rfc3339(), active_app.clone(), active_app.clone(), "session_end_idle");
                         close_current_session(&mut current, now.to_rfc3339());
                     }
                     update_daily_feature(&mut current, now);
