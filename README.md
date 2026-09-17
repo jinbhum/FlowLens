@@ -4,16 +4,18 @@ Windows용 Tauri 기반 개인 생산성 분석 앱입니다. 사용자의 작�
 
 ## 현재 구현
 
-- 어두운 생산성 대시보드: 총 활동 시간, 집중 세션, 키보드·마우스 액션
+- Windows 활성 창을 1초 간격으로 실제 추적하고 앱별 포커싱 시간/전환 횟수를 집계
+- 어두운 생산성 대시보드: 실제 활동 시간, 앱 활성화, 키보드·마우스 액션
 - 시간대별 집중 흐름 그래프와 패턴 기반 추천 카드
 - 가장 많이 사용한 앱과 자주 방문한 웹사이트 목록
-- 추적 일시정지/재개 UI
-- Tauri Rust command: `set_tracking`, `get_tracking_state`, `capture_snapshot`
-- Windows 활성 창 제목을 수집하는 기본 Windows API 연동 (`GetForegroundWindow`, `GetWindowTextW`)
+- 추적 일시정지/재개 UI 및 설정 페이지의 수집 데이터 전체 삭제
+- Tauri Rust command: `set_tracking`, `get_tracking_state`, `capture_snapshot`, `clear_all_data`
+- Windows 활성 창 제목을 수집하는 Windows API 연동 (`GetForegroundWindow`, `GetWindowTextW`)
+- Windows 앱 데이터 폴더의 `activity.json`에만 저장하며 임시 파일 교체로 기록
 
 ## 개인정보 보호 원칙
 
-FlowLens는 화면 캡처, 키 입력 내용, 문서 본문을 기록하지 않습니다. 수집 대상은 앱 식별자/활성 시간과 입력 이벤트의 개수 같은 집계값이며, 기본 저장 위치는 로컬입니다. 향후 실제 입력 훅을 추가할 때에도 키의 내용이 아니라 이벤트 횟수만 기록하고, 추적 일시정지를 즉시 반영해야 합니다.
+FlowLens는 화면 캡처, 키 입력 내용, 문서 본문, 브라우저 URL을 기록하지 않습니다. 수집 대상은 활성 창 제목/활성 시간과 입력 이벤트 개수 같은 집계값이며 Windows 앱 데이터 폴더의 `activity.json`에만 저장됩니다. 설정 페이지에서 전체 삭제를 실행하면 이 파일과 메모리 상태가 함께 삭제됩니다.
 
 ## 실행
 
