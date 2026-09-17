@@ -36,6 +36,7 @@ jobs:
       - name: Collect release files
         shell: pwsh
         run: |
+          Remove-Item -Recurse -Force release -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Get-ChildItem -Path src-tauri/target/release/bundle -Recurse -File |
             Where-Object { $_.Extension -in '.msi', '.exe' } |
