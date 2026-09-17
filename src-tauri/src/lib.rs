@@ -322,7 +322,7 @@ fn rollover_if_needed(state: &mut TrackingState, now: chrono::DateTime<chrono::L
         state.daily_feature.date = previous_day;
         upsert_current_embedding(state, now);
         reset_daily_activity(state);
-        state.collection_day = today;
+        state.collection_day = today.clone();
         state.daily_feature.date = today;
     }
 }
