@@ -12,7 +12,9 @@ use tauri::Manager;
 const IDLE_THRESHOLD_SECS: u64 = 5 * 60;
 const MAX_TIMELINE: usize = 10_000;
 const MAX_MINUTE_SNAPSHOTS: usize = 43_200;
+const MAX_FLOW_MINUTES: usize = 1_440;
 const MAX_SESSIONS: usize = 500;
+const FOCUS_BUCKET_MINUTES: u8 = 5;
 const MAX_EMBEDDING_HISTORY: usize = 365;
 const EMBEDDING_DIMENSIONS: usize = 24;
 const FOREGROUND_SAMPLE_MS: u64 = 200;
@@ -42,6 +44,19 @@ struct MinuteSnapshot {
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
+struct FlowMinute {
+    start_at: String,
+    observed_seconds: u16,
+    focus_seconds: u16,
+    idle_seconds: u16,
+    switch_count: u16,
+    keyboard_actions: u32,
+    mouse_actions: u32,
+    mouse_distance_px: f32,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 struct WorkSession {
     started_at: String,
     ended_at: Option<String>,
@@ -49,6 +64,7 @@ struct WorkSession {
     idle_seconds: u64,
     switch_count: u64,
     app_count: u64,
+    end_reason: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -131,6 +147,75 @@ struct AdvancedCollectionState {
     helper_last_error: String,
 }
 
+#[derive(Clone, Serialize)]
+struct FocusExperienceView {
+    schema_version: u32,
+    date: String,
+    generated_at: String,
+    is_live: bool,
+    ribbon: FocusFlowView,
+    sessions: SessionReviewView,
+}
+
+#[derive(Clone, Serialize)]
+struct FocusFlowView {
+    bucket_minutes: u8,
+    day_start_at: String,
+    day_end_at: String,
+    buckets: Vec<FocusFlowBucketView>,
+    summary: FocusFlowSummary,
+}
+
+#[derive(Clone, Serialize)]
+struct FocusFlowBucketView {
+    start_at: String,
+    end_at: String,
+    state: String,
+    observed_seconds: u16,
+    focus_seconds: u16,
+    idle_seconds: u16,
+    switch_count: u16,
+    input_actions: u32,
+    intensity: f32,
+}
+
+#[derive(Clone, Serialize)]
+struct FocusFlowSummary {
+    focus_seconds: u64,
+    idle_seconds: u64,
+    longest_focused_span_seconds: u64,
+    highest_switch_bucket_start_at: Option<String>,
+    highest_switch_count: u16,
+}
+
+#[derive(Clone, Serialize)]
+struct SessionReviewView {
+    sessions: Vec<SessionCardView>,
+    summary: SessionSummary,
+}
+
+#[derive(Clone, Serialize)]
+struct SessionCardView {
+    id: String,
+    started_at: String,
+    ended_at: Option<String>,
+    is_live: bool,
+    status: String,
+    active_seconds: u64,
+    app_count: u64,
+    switch_count: u64,
+    switches_per_active_hour: f32,
+    end_reason: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct SessionSummary {
+    completed_count: u64,
+    active_seconds: u64,
+    longest_session_seconds: u64,
+    average_session_seconds: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct TrackingState {
@@ -144,6 +229,7 @@ struct TrackingState {
     apps: Vec<AppActivity>,
     timeline: Vec<TimelineEvent>,
     minute_snapshots: Vec<MinuteSnapshot>,
+    flow_minutes: Vec<FlowMinute>,
     active_app_count: u64,
     mouse_distance_px: f64,
     mouse_clicks: u64,
@@ -179,7 +265,7 @@ impl Default for TrackingState {
         Self {
             enabled: true, active_window: String::new(), keyboard_actions: 0, mouse_actions: 0,
             app_activation_count: 0, focus_seconds: 0, hourly_focus: [0; 24], apps: Vec::new(),
-            timeline: Vec::new(), minute_snapshots: Vec::new(), active_app_count: 0,
+            timeline: Vec::new(), minute_snapshots: Vec::new(), flow_minutes: Vec::new(), active_app_count: 0,
             mouse_distance_px: 0.0, mouse_clicks: 0, avg_click_interval_ms: 0,
             click_interval_count: 0, click_interval_mean_ms: 0.0, click_interval_m2: 0.0,
             network_rx_bytes: 0, network_tx_bytes: 0, notification_count: 0, idle_seconds: 0,
@@ -228,17 +314,225 @@ fn record_app_focus(state: &mut TrackingState, app_name: &str, title: &str, elap
     item.seconds = item.active_millis / 1000;
 }
 
+fn flow_minute_key(now: chrono::DateTime<chrono::Local>) -> String {
+    now.format("%Y-%m-%dT%H:%M:00%:z").to_string()
+}
+
+fn flow_minute_for<'a>(state: &'a mut TrackingState, now: chrono::DateTime<chrono::Local>) -> &'a mut FlowMinute {
+    let key = flow_minute_key(now);
+    if let Some(index) = state.flow_minutes.iter().position(|item| item.start_at == key) {
+        return &mut state.flow_minutes[index];
+    }
+    state.flow_minutes.push(FlowMinute { start_at: key, ..Default::default() });
+    if state.flow_minutes.len() > MAX_FLOW_MINUTES { state.flow_minutes.remove(0); }
+    state.flow_minutes.last_mut().expect("flow minute inserted")
+}
+
+fn record_flow_input(
+    state: &mut TrackingState,
+    now: chrono::DateTime<chrono::Local>,
+    keyboard_actions: u64,
+    mouse_actions: u32,
+    mouse_distance_px: f32,
+) {
+    if keyboard_actions == 0 && mouse_actions == 0 && mouse_distance_px <= 0.0 { return; }
+    let minute = flow_minute_for(state, now);
+    minute.keyboard_actions = minute.keyboard_actions.saturating_add(keyboard_actions.min(u32::MAX as u64) as u32);
+    minute.mouse_actions = minute.mouse_actions.saturating_add(mouse_actions);
+    minute.mouse_distance_px += mouse_distance_px.max(0.0);
+}
+
+#[derive(Clone, Default)]
+struct FlowBucketAccumulator {
+    observed_seconds: u32,
+    focus_seconds: u32,
+    idle_seconds: u32,
+    switch_count: u32,
+    input_actions: u32,
+}
+
+fn flow_bucket_timestamp(date: &str, minute_of_day: usize) -> String {
+    let day_offset = minute_of_day / 1_440;
+    let minute = minute_of_day % 1_440;
+    let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Local::now().date_naive())
+        + chrono::Duration::days(day_offset as i64);
+    format!("{}T{:02}:{:02}:00{}", day.format("%Y-%m-%d"), minute / 60, minute % 60, chrono::Local::now().format("%:z"))
+}
+
+fn flow_minute_slot(item: &FlowMinute, date: &str, bucket_minutes: u8) -> Option<usize> {
+    use chrono::Timelike;
+    if !item.start_at.starts_with(date) { return None; }
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&item.start_at).ok()?;
+    let minute_of_day = timestamp.hour() as usize * 60 + timestamp.minute() as usize;
+    Some(minute_of_day / bucket_minutes as usize)
+}
+
+fn flow_state_and_intensity(values: &FlowBucketAccumulator) -> (String, f32) {
+    if values.observed_seconds < 30 { return ("unobserved".into(), 0.0); }
+    let observed = values.observed_seconds.max(1) as f32;
+    let focus_ratio = values.focus_seconds as f32 / observed;
+    let idle_ratio = values.idle_seconds as f32 / observed;
+    let switches_per_minute = values.switch_count as f32 / (observed / 60.0).max(1.0);
+    let input_density = ((1.0 + values.input_actions as f32).ln() / (121.0_f32).ln()).clamp(0.0, 1.0);
+    let switch_penalty = (values.switch_count as f32 / 6.0).clamp(0.0, 1.0);
+    let intensity = (0.65 * focus_ratio + 0.25 * input_density + 0.10 * (1.0 - switch_penalty)).clamp(0.0, 1.0);
+    if idle_ratio >= 0.60 { ("idle".into(), intensity.min(0.25)) }
+    else if values.switch_count >= 4 || switches_per_minute >= 0.80 { ("switching".into(), intensity) }
+    else if focus_ratio >= 0.75 && values.switch_count <= 2 { ("focused".into(), intensity) }
+    else { ("mixed".into(), intensity) }
+}
+
+fn session_status(active_seconds: u64, switch_count: u64) -> String {
+    let switches_per_hour = if active_seconds > 0 { switch_count as f64 / (active_seconds as f64 / 3600.0) } else { 0.0 };
+    if active_seconds < 10 * 60 { "brief".into() }
+    else if active_seconds >= 25 * 60 && switches_per_hour < 6.0 { "focused".into() }
+    else if active_seconds >= 15 * 60 && switches_per_hour < 12.0 { "steady".into() }
+    else { "fragmented".into() }
+}
+
+fn session_card(
+    id: String,
+    started_at: String,
+    ended_at: Option<String>,
+    is_live: bool,
+    active_seconds: u64,
+    app_count: u64,
+    switch_count: u64,
+    end_reason: Option<String>,
+) -> SessionCardView {
+    let switches_per_active_hour = if active_seconds > 0 {
+        switch_count as f64 / (active_seconds as f64 / 3600.0)
+    } else { 0.0 };
+    SessionCardView {
+        id,
+        started_at,
+        ended_at,
+        is_live,
+        status: session_status(active_seconds, switch_count),
+        active_seconds,
+        app_count,
+        switch_count,
+        switches_per_active_hour: switches_per_active_hour as f32,
+        end_reason,
+    }
+}
+
+fn build_focus_experience_view(state: &TrackingState, date: &str, bucket_minutes: u8) -> FocusExperienceView {
+    let bucket_count = 1_440 / bucket_minutes as usize;
+    let mut aggregates = vec![FlowBucketAccumulator::default(); bucket_count];
+    for minute in &state.flow_minutes {
+        if let Some(slot) = flow_minute_slot(minute, date, bucket_minutes) {
+            if let Some(values) = aggregates.get_mut(slot) {
+                values.observed_seconds = values.observed_seconds.saturating_add(minute.observed_seconds as u32);
+                values.focus_seconds = values.focus_seconds.saturating_add(minute.focus_seconds as u32);
+                values.idle_seconds = values.idle_seconds.saturating_add(minute.idle_seconds as u32);
+                values.switch_count = values.switch_count.saturating_add(minute.switch_count as u32);
+                values.input_actions = values.input_actions.saturating_add(minute.keyboard_actions.saturating_add(minute.mouse_actions));
+            }
+        }
+    }
+
+    let mut focus_seconds = 0u64;
+    let mut idle_seconds = 0u64;
+    let mut longest_focused_span_seconds = 0u64;
+    let mut current_focused_span_seconds = 0u64;
+    let mut highest_switch_count = 0u16;
+    let mut highest_switch_bucket_start_at = None;
+    let mut buckets = Vec::with_capacity(bucket_count);
+
+    for (index, values) in aggregates.iter().enumerate() {
+        let (state_name, intensity) = flow_state_and_intensity(values);
+        let start_at = flow_bucket_timestamp(date, index * bucket_minutes as usize);
+        let end_at = flow_bucket_timestamp(date, (index + 1) * bucket_minutes as usize);
+        let observed = values.observed_seconds.min(u16::MAX as u32) as u16;
+        let focus = values.focus_seconds.min(u16::MAX as u32) as u16;
+        let idle = values.idle_seconds.min(u16::MAX as u32) as u16;
+        let switches = values.switch_count.min(u16::MAX as u32) as u16;
+        focus_seconds = focus_seconds.saturating_add(values.focus_seconds as u64);
+        idle_seconds = idle_seconds.saturating_add(values.idle_seconds as u64);
+        if state_name == "focused" {
+            current_focused_span_seconds = current_focused_span_seconds.saturating_add(values.focus_seconds as u64);
+            longest_focused_span_seconds = longest_focused_span_seconds.max(current_focused_span_seconds);
+        } else { current_focused_span_seconds = 0; }
+        if switches > highest_switch_count {
+            highest_switch_count = switches;
+            highest_switch_bucket_start_at = Some(start_at.clone());
+        }
+        buckets.push(FocusFlowBucketView {
+            start_at,
+            end_at,
+            state: state_name,
+            observed_seconds: observed,
+            focus_seconds: focus,
+            idle_seconds: idle,
+            switch_count: switches,
+            input_actions: values.input_actions,
+            intensity,
+        });
+    }
+
+    let mut cards: Vec<SessionCardView> = state.sessions.iter().enumerate()
+        .filter(|(_, session)| session.started_at.starts_with(date))
+        .map(|(index, session)| session_card(
+            format!("{}-{index}", session.started_at),
+            session.started_at.clone(),
+            session.ended_at.clone(),
+            false,
+            session.active_seconds,
+            session.app_count,
+            session.switch_count,
+            session.end_reason.clone(),
+        )).collect();
+    if let Some(started_at) = state.current_session_started_at.as_ref().filter(|value| value.starts_with(date)) {
+        cards.push(session_card(
+            format!("live-{started_at}"),
+            started_at.clone(),
+            None,
+            state.enabled,
+            state.current_session_active_seconds,
+            state.current_session_apps.len() as u64,
+            state.current_session_switches,
+            None,
+        ));
+    }
+    cards.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+    let completed_count = cards.iter().filter(|item| !item.is_live).count() as u64;
+    let active_seconds = cards.iter().map(|item| item.active_seconds).sum::<u64>();
+    let longest_session_seconds = cards.iter().map(|item| item.active_seconds).max().unwrap_or(0);
+    let average_session_seconds = if cards.is_empty() { 0 } else { active_seconds / cards.len() as u64 };
+    let is_live = state.enabled && cards.iter().any(|item| item.is_live);
+
+    FocusExperienceView {
+        schema_version: 1,
+        date: date.into(),
+        generated_at: chrono::Local::now().to_rfc3339(),
+        is_live,
+        ribbon: FocusFlowView {
+            bucket_minutes,
+            day_start_at: flow_bucket_timestamp(date, 0),
+            day_end_at: flow_bucket_timestamp(date, 1_440),
+            buckets,
+            summary: FocusFlowSummary { focus_seconds, idle_seconds, longest_focused_span_seconds, highest_switch_bucket_start_at, highest_switch_count },
+        },
+        sessions: SessionReviewView {
+            sessions: cards,
+            summary: SessionSummary { completed_count, active_seconds, longest_session_seconds, average_session_seconds },
+        },
+    }
+}
+
 fn record_event(state: &mut TrackingState, at: String, app: String, title: String, kind: &str) {
     state.timeline.push(TimelineEvent { at, app, title, kind: kind.into() });
     if state.timeline.len() > MAX_TIMELINE { state.timeline.remove(0); }
 }
 
-fn close_current_session(state: &mut TrackingState, ended_at: String) {
+fn close_current_session(state: &mut TrackingState, ended_at: String, end_reason: &str) {
     if let Some(started_at) = state.current_session_started_at.take() {
         state.sessions.push(WorkSession {
             started_at, ended_at: Some(ended_at), active_seconds: state.current_session_active_seconds,
             idle_seconds: state.current_session_idle_seconds, switch_count: state.current_session_switches,
-            app_count: state.current_session_apps.len() as u64,
+            app_count: state.current_session_apps.len() as u64, end_reason: Some(end_reason.into()),
         });
         if state.sessions.len() > MAX_SESSIONS { state.sessions.remove(0); }
     }
@@ -326,7 +620,7 @@ fn upsert_current_embedding(state: &mut TrackingState, now: chrono::DateTime<chr
 
 fn reset_daily_activity(state: &mut TrackingState) {
     state.active_window.clear(); state.keyboard_actions = 0; state.mouse_actions = 0; state.app_activation_count = 0; state.focus_seconds = 0;
-    state.hourly_focus = [0; 24]; state.apps.clear(); state.timeline.clear(); state.minute_snapshots.clear(); state.active_app_count = 0;
+    state.hourly_focus = [0; 24]; state.apps.clear(); state.timeline.clear(); state.minute_snapshots.clear(); state.flow_minutes.clear(); state.active_app_count = 0;
     state.mouse_distance_px = 0.0; state.mouse_clicks = 0; state.avg_click_interval_ms = 0; state.click_interval_count = 0;
     state.click_interval_mean_ms = 0.0; state.click_interval_m2 = 0.0; state.network_rx_bytes = 0; state.network_tx_bytes = 0;
     state.notification_count = 0; state.idle_seconds = 0; state.context_switches = 0; state.sessions.clear();
@@ -394,9 +688,29 @@ fn analyze_embedding(state: &TrackingState) -> EmbeddingAnalysis {
 }
 
 #[tauri::command]
-fn set_tracking(enabled: bool, state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<TrackingState, String> { let mut current = state.lock().map_err(|_| "state unavailable")?; current.enabled = enabled; save(&current, &storage_path(&path)?)?; Ok(current.clone()) }
+fn set_tracking(enabled: bool, state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<TrackingState, String> {
+    let mut current = state.lock().map_err(|_| "state unavailable")?;
+    if current.enabled && !enabled && current.current_session_started_at.is_some() {
+        let now = chrono::Local::now();
+        let app = current.active_window.clone();
+        record_event(&mut current, now.to_rfc3339(), app.clone(), app, "session_end_paused");
+        close_current_session(&mut current, now.to_rfc3339(), "tracking_paused");
+    }
+    current.enabled = enabled;
+    save(&current, &storage_path(&path)?)?;
+    Ok(current.clone())
+}
 #[tauri::command]
 fn get_tracking_state(state: tauri::State<'_, SharedState>) -> Result<TrackingState, String> { state.lock().map(|value| value.clone()).map_err(|_| "state unavailable".into()) }
+#[tauri::command]
+fn get_focus_experience_view(date: String, bucket_minutes: u8, state: tauri::State<'_, SharedState>) -> Result<FocusExperienceView, String> {
+    if bucket_minutes != FOCUS_BUCKET_MINUTES { return Err(format!("only {FOCUS_BUCKET_MINUTES}-minute focus buckets are supported")); }
+    let current = state.lock().map_err(|_| "state unavailable")?;
+    let selected_date = if date.is_empty() { current.collection_day.clone() } else { date };
+    if selected_date.is_empty() { return Err("collection day unavailable".into()); }
+    if selected_date != current.collection_day { return Err("P0 focus experience currently supports the locally collected current day only".into()); }
+    Ok(build_focus_experience_view(&current, &selected_date, bucket_minutes))
+}
 #[tauri::command]
 fn get_daily_feature_vector(state: tauri::State<'_, SharedState>) -> Result<DailyFeatureVector, String> { state.lock().map(|value| value.daily_feature.clone()).map_err(|_| "state unavailable".into()) }
 #[tauri::command]
@@ -538,17 +852,28 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                 previous_keys[key] = down;
             }
             let mut input_seen = key_presses > 0 || click_started;
+            let input_now = Local::now();
             if let Ok(mut current) = state.lock() {
+                rollover_if_needed(&mut current, input_now);
                 current.keyboard_actions += key_presses;
+                let mut flow_mouse_actions = 0u32;
+                let mut flow_mouse_distance_px = 0.0f32;
                 if cursor_ok {
                     let dx = (cursor.x - previous_cursor.x) as f64;
                     let dy = (cursor.y - previous_cursor.y) as f64;
                     let distance = (dx * dx + dy * dy).sqrt();
-                    if distance > 0.0 { current.mouse_actions += 1; current.mouse_distance_px += distance; input_seen = true; }
+                    if distance > 0.0 {
+                        current.mouse_actions += 1;
+                        current.mouse_distance_px += distance;
+                        flow_mouse_actions = flow_mouse_actions.saturating_add(1);
+                        flow_mouse_distance_px = distance.min(f32::MAX as f64) as f32;
+                        input_seen = true;
+                    }
                     previous_cursor = cursor;
                 }
                 if click_started {
                     current.mouse_clicks += 1;
+                    flow_mouse_actions = flow_mouse_actions.saturating_add(1);
                     if let Some(previous) = last_click {
                         let interval = previous.elapsed().as_millis() as u64;
                         current.click_interval_count += 1;
@@ -559,9 +884,10 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                     }
                     last_click = Some(Instant::now());
                 }
+                record_flow_input(&mut current, input_now, key_presses, flow_mouse_actions, flow_mouse_distance_px);
                 if input_seen {
                     last_input = Instant::now();
-                    current.last_input_at = Some(Local::now().to_rfc3339());
+                    current.last_input_at = Some(input_now.to_rfc3339());
                     current.last_input_age_seconds = 0;
                 } else { current.last_input_age_seconds = last_input.elapsed().as_secs(); }
             }
@@ -583,6 +909,8 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                             current.current_session_switches = current.current_session_switches.saturating_add(1);
                             if !current.current_session_apps.iter().any(|app| app == &window.app) { current.current_session_apps.push(window.app.clone()); }
                             record_event(&mut current, now.to_rfc3339(), window.app.clone(), window.title.clone(), "app_switch");
+                            let minute = flow_minute_for(&mut current, now);
+                            minute.switch_count = minute.switch_count.saturating_add(1);
                             let item = ensure_app(&mut current, &window.app, &window.title);
                             item.activations = item.activations.saturating_add(1);
                             previous_identity = window.identity;
@@ -609,6 +937,10 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                         current.current_session_active_seconds += 1;
                         current.hourly_focus[now.hour() as usize] += 1;
                     }
+                    let minute = flow_minute_for(&mut current, now);
+                    minute.observed_seconds = minute.observed_seconds.saturating_add(1);
+                    if idle { minute.idle_seconds = minute.idle_seconds.saturating_add(1); }
+                    else { minute.focus_seconds = minute.focus_seconds.saturating_add(1); }
                     let active_app = current.active_window.clone();
                     if !idle && current.current_session_started_at.is_none() {
                         current.resume_latency_seconds = current.last_input_age_seconds;
@@ -617,7 +949,7 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                     }
                     if idle && current.current_session_started_at.is_some() {
                         record_event(&mut current, now.to_rfc3339(), active_app.clone(), active_app.clone(), "session_end_idle");
-                        close_current_session(&mut current, now.to_rfc3339());
+                        close_current_session(&mut current, now.to_rfc3339(), "idle");
                     }
                     update_daily_feature(&mut current, now);
                 }
@@ -661,5 +993,62 @@ pub fn run() {
         if let Ok(mut current) = setup_state.lock() { *current = load(&file); let now = chrono::Local::now(); rollover_if_needed(&mut current, now); if current.collection_day.is_empty() { current.collection_day = now.date_naive().to_string(); current.daily_feature.date = current.collection_day.clone(); } }
         if let Ok(mut current_path) = setup_path.lock() { *current_path = file; }
         start_tracker(setup_state.clone(), setup_path.clone()); Ok(())
-    }).manage(state).manage(path).invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, request_notification_access, request_per_app_network_collection]).run(tauri::generate_context!()).expect("error while running FlowLens");
+    }).manage(state).manage(path).invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, request_notification_access, request_per_app_network_collection]).run(tauri::generate_context!()).expect("error while running FlowLens");
+}
+
+
+#[cfg(test)]
+mod focus_experience_tests {
+    use super::*;
+
+    fn minute(at: &str, focus_seconds: u16, idle_seconds: u16, switch_count: u16, inputs: u32) -> FlowMinute {
+        FlowMinute {
+            start_at: at.into(), observed_seconds: focus_seconds.saturating_add(idle_seconds), focus_seconds, idle_seconds,
+            switch_count, keyboard_actions: inputs, mouse_actions: 0, mouse_distance_px: 0.0,
+        }
+    }
+
+    #[test]
+    fn builds_five_minute_focus_and_switching_buckets() {
+        let mut state = TrackingState::default();
+        state.collection_day = "2026-09-17".into();
+        state.flow_minutes = vec![
+            minute("2026-09-17T09:00:00+09:00", 60, 0, 0, 12),
+            minute("2026-09-17T09:01:00+09:00", 60, 0, 1, 12),
+            minute("2026-09-17T09:02:00+09:00", 60, 0, 0, 12),
+            minute("2026-09-17T09:03:00+09:00", 60, 0, 1, 12),
+            minute("2026-09-17T09:04:00+09:00", 60, 0, 0, 12),
+            minute("2026-09-17T10:00:00+09:00", 60, 0, 4, 8),
+            minute("2026-09-17T11:00:00+09:00", 10, 50, 0, 0),
+        ];
+        let view = build_focus_experience_view(&state, "2026-09-17", 5);
+        let focused = &view.ribbon.buckets[108];
+        let switching = &view.ribbon.buckets[120];
+        assert_eq!(focused.state, "focused");
+        assert_eq!(focused.focus_seconds, 300);
+        assert_eq!(focused.switch_count, 2);
+        assert_eq!(switching.state, "switching");
+        assert_eq!(view.ribbon.buckets[132].state, "idle");
+        assert_eq!(view.ribbon.buckets[0].state, "unobserved");
+        assert_eq!(view.ribbon.summary.longest_focused_span_seconds, 300);
+    }
+
+    #[test]
+    fn includes_completed_and_live_session_cards_in_reverse_time_order() {
+        let mut state = TrackingState::default();
+        state.collection_day = "2026-09-17".into();
+        state.sessions.push(WorkSession {
+            started_at: "2026-09-17T09:00:00+09:00".into(), ended_at: Some("2026-09-17T09:30:00+09:00".into()),
+            active_seconds: 1_800, idle_seconds: 0, switch_count: 2, app_count: 2, end_reason: Some("idle".into()),
+        });
+        state.current_session_started_at = Some("2026-09-17T10:00:00+09:00".into());
+        state.current_session_active_seconds = 900;
+        state.current_session_switches = 1;
+        state.current_session_apps = vec!["editor.exe".into()];
+        let view = build_focus_experience_view(&state, "2026-09-17", 5);
+        assert_eq!(view.sessions.sessions.len(), 2);
+        assert!(view.sessions.sessions[0].is_live);
+        assert_eq!(view.sessions.sessions[0].status, "steady");
+        assert_eq!(view.sessions.summary.completed_count, 1);
+    }
 }

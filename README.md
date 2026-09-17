@@ -13,6 +13,8 @@ Windows용 Tauri 기반 개인 생산성 분석 앱입니다. 사용자의 작�
 - Windows 활성 창 제목을 수집하는 Windows API 연동 (`GetForegroundWindow`, `GetWindowTextW`)
 - Windows 앱 데이터 폴더의 `activity.json`에만 저장하며 임시 파일 교체로 기록
 - 분당 활성 앱 수, 앱 전환 타임라인, 마우스 이동 거리·클릭 간격, 네트워크 인터페이스 총량 추적
+- 리본 전용 `FlowMinute` 로컬 버킷: 관측·집중·유휴 초, 전환 수, 키보드·마우스 입력 집계만 기록하며 앱 이름·창 제목은 포함하지 않음
+- `get_focus_experience_view` IPC: 5분 집중 흐름 버킷과 완료·진행 세션 카드용 읽기 모델을 로컬에서 생성
 - 추가 행동 지표와 로컬 임베딩 분석 설계: `BEHAVIOR_ANALYTICS.md`
 - 유휴 시간, 작업 세션, 재개 지연, 컨텍스트 전환 밀도, 입력·클릭 리듬, 앱 시간 분포를 `DailyFeatureVector`로 로컬 계산
 - 알림/앱별 네트워크의 별도 권한·배포 경로: `ADVANCED_COLLECTION.md`

@@ -30,6 +30,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run Rust aggregation tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
       - name: Build Tauri installer
         run: npm run tauri build
 
