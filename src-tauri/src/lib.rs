@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -14,10 +15,11 @@ const MAX_MINUTE_SNAPSHOTS: usize = 43_200;
 const MAX_SESSIONS: usize = 500;
 const MAX_EMBEDDING_HISTORY: usize = 365;
 const EMBEDDING_DIMENSIONS: usize = 24;
+const FOREGROUND_SAMPLE_MS: u64 = 200;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
-struct AppActivity { app: String, title: String, seconds: u64, activations: u64 }
+struct AppActivity { app: String, title: String, seconds: u64, active_millis: u64, activations: u64 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -168,6 +170,8 @@ struct TrackingState {
     embedding_enabled: bool,
     embedding_history: Vec<EmbeddingRecord>,
     advanced: AdvancedCollectionState,
+    tracker_sample_interval_ms: u64,
+    unresolved_window_count: u64,
 }
 
 impl Default for TrackingState {
@@ -187,6 +191,7 @@ impl Default for TrackingState {
             daily_feature: DailyFeatureVector { schema_version: 2, local_only: true, ..Default::default() },
             embedding_enabled: false, embedding_history: Vec::new(),
             advanced: AdvancedCollectionState { notification_access: "not_requested".into(), per_app_network_status: "not_requested".into(), ..Default::default() },
+            tracker_sample_interval_ms: FOREGROUND_SAMPLE_MS, unresolved_window_count: 0,
         }
     }
 }
@@ -203,6 +208,25 @@ fn save(state: &TrackingState, path: &PathBuf) -> Result<(), String> {
 }
 fn load(path: &PathBuf) -> TrackingState { fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default() }
 fn storage_path(path: &SharedPath) -> Result<PathBuf, String> { path.lock().map(|value| value.clone()).map_err(|_| "storage path unavailable".into()) }
+
+
+fn ensure_app(state: &mut TrackingState, app_name: &str, title: &str) -> &mut AppActivity {
+    if let Some(index) = state.apps.iter().position(|item| item.app == app_name) {
+        let item = &mut state.apps[index];
+        if item.active_millis < item.seconds.saturating_mul(1000) { item.active_millis = item.seconds.saturating_mul(1000); }
+        if !title.is_empty() && title != "제목 없음" { item.title = title.to_string(); }
+        return item;
+    }
+    state.apps.push(AppActivity { app: app_name.to_string(), title: title.to_string(), seconds: 0, active_millis: 0, activations: 0 });
+    state.apps.last_mut().expect("app activity inserted")
+}
+
+fn record_app_focus(state: &mut TrackingState, app_name: &str, title: &str, elapsed_ms: u64, activated: bool) {
+    let item = ensure_app(state, app_name, title);
+    if activated { item.activations = item.activations.saturating_add(1); }
+    item.active_millis = item.active_millis.saturating_add(elapsed_ms);
+    item.seconds = item.active_millis / 1000;
+}
 
 fn record_event(state: &mut TrackingState, at: String, app: String, title: String, kind: &str) {
     state.timeline.push(TimelineEvent { at, app, title, kind: kind.into() });
@@ -236,8 +260,8 @@ fn update_daily_feature(state: &mut TrackingState, now: chrono::DateTime<chrono:
     let work_start = state.hourly_focus.iter().position(|value| *value > 0).map(|hour| hour as u8);
     let work_end = state.hourly_focus.iter().rposition(|value| *value > 0).map(|hour| hour as u8);
     let work_span_hours = match (work_start, work_end) { (Some(start), Some(end)) if end >= start => (end - start + 1) as f64, _ => 0.0 };
-    let total_app_seconds = state.apps.iter().map(|app| app.seconds).sum::<u64>().max(1) as f64;
-    let mut shares: Vec<f64> = state.apps.iter().map(|app| app.seconds as f64 / total_app_seconds).collect();
+    let total_app_millis = state.apps.iter().map(|app| app.active_millis.max(app.seconds.saturating_mul(1000))).sum::<u64>().max(1) as f64;
+    let mut shares: Vec<f64> = state.apps.iter().map(|app| app.active_millis.max(app.seconds.saturating_mul(1000)) as f64 / total_app_millis).collect();
     shares.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     shares.truncate(12);
     state.daily_feature = DailyFeatureVector {
@@ -393,13 +417,83 @@ fn request_notification_access(state: tauri::State<'_, SharedState>, path: tauri
 fn request_per_app_network_collection(state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<AdvancedCollectionState, String> { let mut current = state.lock().map_err(|_| "state unavailable")?; current.advanced.per_app_network_requested = true; current.advanced.per_app_network_status = "admin_required_etw_helper_not_installed".into(); current.advanced.helper_last_error = "앱별 네트워크 바이트는 시스템 ETW 세션을 사용하므로 관리자 권한으로 설치되는 선택적 수집기가 필요합니다.".into(); save(&current, &storage_path(&path)?)?; Ok(current.advanced.clone()) }
 
 #[cfg(windows)]
-fn active_window() -> String { use windows::Win32::Foundation::HWND; use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW}; let hwnd = unsafe { GetForegroundWindow() }; if hwnd == HWND::default() { return String::new(); } let mut buffer = [0u16; 512]; let length = unsafe { GetWindowTextW(hwnd, &mut buffer) }; String::from_utf16_lossy(&buffer[..length as usize]) }
+#[derive(Clone)]
+struct ForegroundWindow {
+    identity: String,
+    app: String,
+    title: String,
+    process_resolved: bool,
+}
+
 #[cfg(windows)]
-unsafe extern "system" fn count_visible_window(hwnd: windows::Win32::Foundation::HWND, lparam: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL { use windows::Win32::Foundation::BOOL; use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, IsWindowVisible}; if IsWindowVisible(hwnd).as_bool() && GetWindowTextLengthW(hwnd) > 0 { let count = &mut *(lparam.0 as *mut u64); *count += 1; } BOOL(1) }
+fn executable_name(process_id: u32) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
+    let mut buffer = [0u16; 32_768];
+    let mut size = buffer.len() as u32;
+    let result = unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size) };
+    let _ = unsafe { CloseHandle(handle) };
+    result.ok()?;
+    let path = String::from_utf16_lossy(&buffer[..size as usize]);
+    path.rsplit(|character| character == '\\' || character == '/').next().filter(|value| !value.is_empty()).map(str::to_string)
+}
+
 #[cfg(windows)]
-fn visible_app_count() -> u64 { use windows::Win32::Foundation::LPARAM; use windows::Win32::UI::WindowsAndMessaging::EnumWindows; let mut count = 0u64; let _ = unsafe { EnumWindows(Some(count_visible_window), LPARAM((&mut count as *mut u64) as isize)) }; count }
+fn foreground_window(process_cache: &mut HashMap<u32, (String, bool)>) -> Option<ForegroundWindow> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId};
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd == HWND::default() { return None; }
+    let mut process_id = 0u32;
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) } == 0 || process_id == 0 { return None; }
+    let mut buffer = [0u16; 512];
+    let length = unsafe { GetWindowTextW(hwnd, &mut buffer) };
+    let title = if length > 0 { String::from_utf16_lossy(&buffer[..length as usize]) } else { "제목 없음".into() };
+    let (app, process_resolved) = process_cache.entry(process_id).or_insert_with(|| {
+        executable_name(process_id).map(|name| (name, true)).unwrap_or_else(|| (format!("보호된 프로세스 (PID {process_id})"), false))
+    }).clone();
+    Some(ForegroundWindow { identity: format!("{}:{}", process_id, hwnd.0), app, title, process_resolved })
+}
+
 #[cfg(windows)]
-fn network_totals() -> (u64, u64) { use std::ffi::c_void; use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2}; let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut(); let result = unsafe { GetIfTable2(&mut table) }; if result.0 != 0 || table.is_null() { return (0, 0); } let table_ref = unsafe { &*table }; let first_row = table_ref.Table.as_ptr(); let mut received = 0u64; let mut sent = 0u64; for index in 0..table_ref.NumEntries as usize { let row = unsafe { &*first_row.add(index) }; received = received.saturating_add(row.InOctets); sent = sent.saturating_add(row.OutOctets); } unsafe { FreeMibTable(table as *const c_void) }; (received, sent) }
+unsafe extern "system" fn count_visible_window(hwnd: windows::Win32::Foundation::HWND, lparam: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::BOOL {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+    if IsWindowVisible(hwnd).as_bool() { let count = &mut *(lparam.0 as *mut u64); *count += 1; }
+    BOOL(1)
+}
+
+#[cfg(windows)]
+fn visible_app_count() -> u64 {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+    let mut count = 0u64;
+    let _ = unsafe { EnumWindows(Some(count_visible_window), LPARAM((&mut count as *mut u64) as isize)) };
+    count
+}
+
+#[cfg(windows)]
+fn network_totals() -> (u64, u64) {
+    use std::ffi::c_void;
+    use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+    let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+    let result = unsafe { GetIfTable2(&mut table) };
+    if result.0 != 0 || table.is_null() { return (0, 0); }
+    let table_ref = unsafe { &*table };
+    let first_row = table_ref.Table.as_ptr();
+    let mut received = 0u64;
+    let mut sent = 0u64;
+    for index in 0..table_ref.NumEntries as usize {
+        let row = unsafe { &*first_row.add(index) };
+        received = received.saturating_add(row.InOctets);
+        sent = sent.saturating_add(row.OutOctets);
+    }
+    unsafe { FreeMibTable(table as *const c_void) };
+    (received, sent)
+}
+
 #[cfg(not(windows))]
 fn network_totals() -> (u64, u64) { (0, 0) }
 
@@ -410,46 +504,149 @@ fn start_tracker(state: SharedState, path: SharedPath) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     thread::spawn(move || {
-        let mut previous_window = String::new(); let mut previous_cursor = POINT { x: 0, y: 0 }; let mut previous_keys = [false; 255]; let mut previous_left = false; let mut previous_right = false;
-        let mut last_click: Option<Instant> = None; let mut last_second = Instant::now(); let mut last_save = Instant::now(); let mut last_minute = Local::now().minute(); let mut previous_network = network_totals(); let mut last_input = Instant::now();
+        let mut previous_identity = String::new();
+        let mut previous_cursor = POINT { x: 0, y: 0 };
+        let mut previous_keys = [false; 255];
+        let mut previous_left = false;
+        let mut previous_right = false;
+        let mut last_click: Option<Instant> = None;
+        let mut last_second = Instant::now();
+        let mut last_foreground_sample = Instant::now();
+        let mut last_save = Instant::now();
+        let mut last_minute = Local::now().minute();
+        let mut previous_network = network_totals();
+        let mut last_input = Instant::now();
+        let mut process_cache: HashMap<u32, (String, bool)> = HashMap::new();
         loop {
             thread::sleep(Duration::from_millis(50));
-            if !state.lock().map(|value| value.enabled).unwrap_or(false) { continue; }
-            let mut cursor = POINT { x: 0, y: 0 }; let cursor_ok = unsafe { GetCursorPos(&mut cursor) }.is_ok(); let left_down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0; let right_down = unsafe { GetAsyncKeyState(VK_RBUTTON.0 as i32) } < 0; let click_started = (left_down && !previous_left) || (right_down && !previous_right); previous_left = left_down; previous_right = right_down;
-            let mut key_presses = 0u64; for key in 0..255 { let down = unsafe { GetAsyncKeyState(key as i32) } < 0; if down && !previous_keys[key] { key_presses += 1; } previous_keys[key] = down; }
+            if !state.lock().map(|value| value.enabled).unwrap_or(false) {
+                last_foreground_sample = Instant::now();
+                last_second = Instant::now();
+                continue;
+            }
+            let mut cursor = POINT { x: 0, y: 0 };
+            let cursor_ok = unsafe { GetCursorPos(&mut cursor) }.is_ok();
+            let left_down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
+            let right_down = unsafe { GetAsyncKeyState(VK_RBUTTON.0 as i32) } < 0;
+            let click_started = (left_down && !previous_left) || (right_down && !previous_right);
+            previous_left = left_down;
+            previous_right = right_down;
+            let mut key_presses = 0u64;
+            for key in 0..255 {
+                let down = unsafe { GetAsyncKeyState(key as i32) } < 0;
+                if down && !previous_keys[key] { key_presses += 1; }
+                previous_keys[key] = down;
+            }
             let mut input_seen = key_presses > 0 || click_started;
             if let Ok(mut current) = state.lock() {
                 current.keyboard_actions += key_presses;
-                if cursor_ok { let dx = (cursor.x - previous_cursor.x) as f64; let dy = (cursor.y - previous_cursor.y) as f64; let distance = (dx * dx + dy * dy).sqrt(); if distance > 0.0 { current.mouse_actions += 1; current.mouse_distance_px += distance; input_seen = true; } previous_cursor = cursor; }
-                if click_started { current.mouse_clicks += 1; if let Some(previous) = last_click { let interval = previous.elapsed().as_millis() as u64; current.click_interval_count += 1; let delta = interval as f64 - current.click_interval_mean_ms; current.click_interval_mean_ms += delta / current.click_interval_count as f64; current.click_interval_m2 += delta * (interval as f64 - current.click_interval_mean_ms); current.avg_click_interval_ms = current.click_interval_mean_ms.round() as u64; } last_click = Some(Instant::now()); }
-                if input_seen { last_input = Instant::now(); current.last_input_at = Some(Local::now().to_rfc3339()); current.last_input_age_seconds = 0; } else { current.last_input_age_seconds = last_input.elapsed().as_secs(); }
+                if cursor_ok {
+                    let dx = (cursor.x - previous_cursor.x) as f64;
+                    let dy = (cursor.y - previous_cursor.y) as f64;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance > 0.0 { current.mouse_actions += 1; current.mouse_distance_px += distance; input_seen = true; }
+                    previous_cursor = cursor;
+                }
+                if click_started {
+                    current.mouse_clicks += 1;
+                    if let Some(previous) = last_click {
+                        let interval = previous.elapsed().as_millis() as u64;
+                        current.click_interval_count += 1;
+                        let delta = interval as f64 - current.click_interval_mean_ms;
+                        current.click_interval_mean_ms += delta / current.click_interval_count as f64;
+                        current.click_interval_m2 += delta * (interval as f64 - current.click_interval_mean_ms);
+                        current.avg_click_interval_ms = current.click_interval_mean_ms.round() as u64;
+                    }
+                    last_click = Some(Instant::now());
+                }
+                if input_seen {
+                    last_input = Instant::now();
+                    current.last_input_at = Some(Local::now().to_rfc3339());
+                    current.last_input_age_seconds = 0;
+                } else { current.last_input_age_seconds = last_input.elapsed().as_secs(); }
             }
-            if last_second.elapsed() >= Duration::from_secs(1) {
-                let now = Local::now(); let window = active_window(); let switched = window != previous_window && !window.is_empty(); let idle = last_input.elapsed().as_secs() >= IDLE_THRESHOLD_SECS;
+
+            if last_foreground_sample.elapsed() >= Duration::from_millis(FOREGROUND_SAMPLE_MS) {
+                let elapsed_ms = last_foreground_sample.elapsed().as_millis().min(1_000) as u64;
+                let now = Local::now();
+                let idle = last_input.elapsed().as_secs() >= IDLE_THRESHOLD_SECS;
+                let foreground = foreground_window(&mut process_cache);
                 if let Ok(mut current) = state.lock() {
                     rollover_if_needed(&mut current, now);
-                    if idle { current.idle_seconds += 1; current.current_session_idle_seconds += 1; } else { current.focus_seconds += 1; current.current_session_active_seconds += 1; current.hourly_focus[now.hour() as usize] += 1; }
-                    current.active_window = window.clone();
-                    if !idle && current.current_session_started_at.is_none() { current.resume_latency_seconds = current.last_input_age_seconds; current.current_session_started_at = Some(now.to_rfc3339()); record_event(&mut current, now.to_rfc3339(), window.clone(), window.clone(), "session_start"); }
-                    if idle && current.current_session_started_at.is_some() { record_event(&mut current, now.to_rfc3339(), window.clone(), window.clone(), "session_end_idle"); close_current_session(&mut current, now.to_rfc3339()); }
-                    if switched { current.app_activation_count += 1; current.context_switches += 1; current.current_session_switches += 1; if !current.current_session_apps.iter().any(|app| app == &window) { current.current_session_apps.push(window.clone()); } record_event(&mut current, now.to_rfc3339(), window.clone(), window.clone(), "app_switch"); previous_window = window.clone(); }
-                    if !idle { if let Some(app) = current.apps.iter_mut().find(|app| app.app == window) { app.seconds += 1; app.title = window.clone(); if switched { app.activations += 1; } } else if !window.is_empty() { current.apps.push(AppActivity { app: window.clone(), title: window, seconds: 1, activations: 1 }); } }
+                    if let Some(window) = foreground {
+                        let switched = window.identity != previous_identity;
+                        current.active_window = window.app.clone();
+                        if switched {
+                            if !window.process_resolved { current.unresolved_window_count = current.unresolved_window_count.saturating_add(1); }
+                            current.app_activation_count = current.app_activation_count.saturating_add(1);
+                            current.context_switches = current.context_switches.saturating_add(1);
+                            current.current_session_switches = current.current_session_switches.saturating_add(1);
+                            if !current.current_session_apps.iter().any(|app| app == &window.app) { current.current_session_apps.push(window.app.clone()); }
+                            record_event(&mut current, now.to_rfc3339(), window.app.clone(), window.title.clone(), "app_switch");
+                            let item = ensure_app(&mut current, &window.app, &window.title);
+                            item.activations = item.activations.saturating_add(1);
+                            previous_identity = window.identity;
+                        }
+                        if !idle { record_app_focus(&mut current, &window.app, &window.title, elapsed_ms, false); }
+                    } else {
+                        current.active_window = "활성 창을 식별할 수 없음".into();
+                        previous_identity.clear();
+                    }
+                }
+                last_foreground_sample = Instant::now();
+            }
+
+            if last_second.elapsed() >= Duration::from_secs(1) {
+                let now = Local::now();
+                let idle = last_input.elapsed().as_secs() >= IDLE_THRESHOLD_SECS;
+                if let Ok(mut current) = state.lock() {
+                    rollover_if_needed(&mut current, now);
+                    if idle {
+                        current.idle_seconds += 1;
+                        current.current_session_idle_seconds += 1;
+                    } else {
+                        current.focus_seconds += 1;
+                        current.current_session_active_seconds += 1;
+                        current.hourly_focus[now.hour() as usize] += 1;
+                    }
+                    let active_app = current.active_window.clone();
+                    if !idle && current.current_session_started_at.is_none() {
+                        current.resume_latency_seconds = current.last_input_age_seconds;
+                        current.current_session_started_at = Some(now.to_rfc3339());
+                        record_event(&mut current, now.to_rfc3339(), active_app.clone(), active_app, "session_start");
+                    }
+                    if idle && current.current_session_started_at.is_some() {
+                        record_event(&mut current, now.to_rfc3339(), active_app.clone(), active_app, "session_end_idle");
+                        close_current_session(&mut current, now.to_rfc3339());
+                    }
                     update_daily_feature(&mut current, now);
                 }
                 last_second = Instant::now();
             }
+
             let now = Local::now();
             if now.minute() != last_minute {
-                let network = network_totals(); let received_delta = network.0.saturating_sub(previous_network.0); let sent_delta = network.1.saturating_sub(previous_network.1); previous_network = network;
+                let network = network_totals();
+                let received_delta = network.0.saturating_sub(previous_network.0);
+                let sent_delta = network.1.saturating_sub(previous_network.1);
+                previous_network = network;
                 if let Ok(mut current) = state.lock() {
-                    current.active_app_count = visible_app_count(); current.network_rx_bytes = current.network_rx_bytes.saturating_add(received_delta); current.network_tx_bytes = current.network_tx_bytes.saturating_add(sent_delta);
+                    current.active_app_count = visible_app_count();
+                    current.network_rx_bytes = current.network_rx_bytes.saturating_add(received_delta);
+                    current.network_tx_bytes = current.network_tx_bytes.saturating_add(sent_delta);
                     let snapshot = MinuteSnapshot { at: now.to_rfc3339(), active_app_count: current.active_app_count, focus_seconds: current.focus_seconds, keyboard_actions: current.keyboard_actions, mouse_actions: current.mouse_actions, mouse_distance_px: current.mouse_distance_px, network_rx_bytes: current.network_rx_bytes, network_tx_bytes: current.network_tx_bytes, idle_seconds: current.idle_seconds, context_switches: current.context_switches };
-                    current.minute_snapshots.push(snapshot); if current.minute_snapshots.len() > MAX_MINUTE_SNAPSHOTS { current.minute_snapshots.remove(0); }
-                    update_daily_feature(&mut current, now); upsert_current_embedding(&mut current, now);
+                    current.minute_snapshots.push(snapshot);
+                    if current.minute_snapshots.len() > MAX_MINUTE_SNAPSHOTS { current.minute_snapshots.remove(0); }
+                    update_daily_feature(&mut current, now);
+                    upsert_current_embedding(&mut current, now);
                 }
+                if process_cache.len() > 512 { process_cache.clear(); }
                 last_minute = now.minute();
             }
-            if last_save.elapsed() >= Duration::from_secs(1) { if let (Ok(current), Ok(file)) = (state.lock(), storage_path(&path)) { let _ = save(&current, &file); } last_save = Instant::now(); }
+            if last_save.elapsed() >= Duration::from_secs(1) {
+                if let (Ok(current), Ok(file)) = (state.lock(), storage_path(&path)) { let _ = save(&current, &file); }
+                last_save = Instant::now();
+            }
         }
     });
 }
