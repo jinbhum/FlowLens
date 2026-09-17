@@ -210,7 +210,7 @@ fn load(path: &PathBuf) -> TrackingState { fs::read(path).ok().and_then(|bytes| 
 fn storage_path(path: &SharedPath) -> Result<PathBuf, String> { path.lock().map(|value| value.clone()).map_err(|_| "storage path unavailable".into()) }
 
 
-fn ensure_app(state: &mut TrackingState, app_name: &str, title: &str) -> &mut AppActivity {
+fn ensure_app<'a>(state: &'a mut TrackingState, app_name: &str, title: &str) -> &'a mut AppActivity {
     if let Some(index) = state.apps.iter().position(|item| item.app == app_name) {
         let item = &mut state.apps[index];
         if item.active_millis < item.seconds.saturating_mul(1000) { item.active_millis = item.seconds.saturating_mul(1000); }
@@ -454,7 +454,7 @@ fn foreground_window(process_cache: &mut HashMap<u32, (String, bool)>) -> Option
     let (app, process_resolved) = process_cache.entry(process_id).or_insert_with(|| {
         executable_name(process_id).map(|name| (name, true)).unwrap_or_else(|| (format!("보호된 프로세스 (PID {process_id})"), false))
     }).clone();
-    Some(ForegroundWindow { identity: format!("{}:{}", process_id, hwnd.0), app, title, process_resolved })
+    Some(ForegroundWindow { identity: format!("{process_id}:{:p}", hwnd.0), app, title, process_resolved })
 }
 
 #[cfg(windows)]
