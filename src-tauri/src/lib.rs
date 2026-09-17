@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -171,7 +170,6 @@ fn close_current_session(state: &mut TrackingState, ended_at: String) {
 }
 
 fn update_daily_feature(state: &mut TrackingState, now: chrono::DateTime<chrono::Local>) {
-    use chrono::Timelike;
     let focus_minutes = state.focus_seconds as f64 / 60.0;
     let idle_minutes = state.idle_seconds as f64 / 60.0;
     let total_minutes = focus_minutes + idle_minutes;
@@ -318,7 +316,14 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                 let network = network_totals(); let received_delta = network.0.saturating_sub(previous_network.0); let sent_delta = network.1.saturating_sub(previous_network.1); previous_network = network;
                 if let Ok(mut current) = state.lock() {
                     current.active_app_count = visible_app_count(); current.network_rx_bytes = current.network_rx_bytes.saturating_add(received_delta); current.network_tx_bytes = current.network_tx_bytes.saturating_add(sent_delta);
-                    current.minute_snapshots.push(MinuteSnapshot { at: now.to_rfc3339(), active_app_count: current.active_app_count, focus_seconds: current.focus_seconds, keyboard_actions: current.keyboard_actions, mouse_actions: current.mouse_actions, mouse_distance_px: current.mouse_distance_px, network_rx_bytes: current.network_rx_bytes, network_tx_bytes: current.network_tx_bytes, idle_seconds: current.idle_seconds, context_switches: current.context_switches });
+                    let snapshot = MinuteSnapshot {
+                        at: now.to_rfc3339(), active_app_count: current.active_app_count,
+                        focus_seconds: current.focus_seconds, keyboard_actions: current.keyboard_actions,
+                        mouse_actions: current.mouse_actions, mouse_distance_px: current.mouse_distance_px,
+                        network_rx_bytes: current.network_rx_bytes, network_tx_bytes: current.network_tx_bytes,
+                        idle_seconds: current.idle_seconds, context_switches: current.context_switches,
+                    };
+                    current.minute_snapshots.push(snapshot);
                     if current.minute_snapshots.len() > MAX_MINUTE_SNAPSHOTS { current.minute_snapshots.remove(0); }
                 }
                 last_minute = now.minute();
