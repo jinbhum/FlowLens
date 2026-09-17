@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 use std::{fs, path::PathBuf, sync::{Arc, Mutex}, thread, time::Duration};
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -19,7 +20,7 @@ fn path_value(path: &SharedPath) -> Result<PathBuf, String> { path.lock().map(|p
 
 #[tauri::command]
 fn set_tracking(enabled: bool, state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<TrackingState, String> {
-    let mut current = state.lock().map_err(|_| "tracking state unavailable")?; current.enabled = enabled; save(&current, &path_value(path)?)?; Ok(current.clone())
+    let mut current = state.lock().map_err(|_| "tracking state unavailable")?; current.enabled = enabled; save(&current, &path_value(&path)?)?; Ok(current.clone())
 }
 #[tauri::command]
 fn get_tracking_state(state: tauri::State<'_, SharedState>) -> Result<TrackingState, String> { state.lock().map(|s| s.clone()).map_err(|_| "tracking state unavailable".into()) }
@@ -27,12 +28,12 @@ fn get_tracking_state(state: tauri::State<'_, SharedState>) -> Result<TrackingSt
 fn capture_snapshot(state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<TrackingState, String> {
     let mut current = state.lock().map_err(|_| "tracking state unavailable")?;
     #[cfg(windows)] if current.enabled { current.active_window = windows_active_window(); }
-    save(&current, &path_value(path)?)?; Ok(current.clone())
+    save(&current, &path_value(&path)?)?; Ok(current.clone())
 }
 #[tauri::command]
 fn clear_all_data(state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<(), String> {
     let mut current = state.lock().map_err(|_| "tracking state unavailable")?; let enabled = current.enabled; *current = TrackingState { enabled, ..Default::default() };
-    let file = path_value(path)?; if file.exists() { fs::remove_file(file).map_err(|e| e.to_string())?; } Ok(())
+    let file = path_value(&path)?; if file.exists() { fs::remove_file(file).map_err(|e| e.to_string())?; } Ok(())
 }
 
 #[cfg(windows)]
