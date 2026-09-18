@@ -1195,6 +1195,76 @@ fn upsert_daily_report(state: &mut TrackingState, report: DailyReportRecord) {
 
 fn allowed_work_mode_tag(tag: &str) -> bool { matches!(tag, "구현" | "디버깅" | "문서화" | "검토" | "회의" | "학습" | "운영 대응") }
 
+fn finalize_local_state_for_exit(state: &mut TrackingState, now: chrono::DateTime<chrono::Local>) {
+    rollover_if_needed(state, now);
+    if state.current_session_started_at.is_some() {
+        let active_app = state.active_window.clone();
+        record_event(state, now.to_rfc3339(), active_app.clone(), active_app, "session_end_app_exit");
+        close_current_session(state, now.to_rfc3339(), "app_exit");
+        state.pending_reentry = None;
+    }
+    refresh_reentry_episodes(state, now);
+    update_daily_feature(state, now);
+    if state.report_settings.enabled && !state.collection_day.is_empty() {
+        let date = state.collection_day.clone();
+        let report = build_daily_report(state, &date, "draft", now);
+        upsert_daily_report(state, report);
+    }
+    upsert_current_embedding(state, now);
+}
+
+fn persist_before_exit(state: &SharedState, path: &SharedPath) -> Result<(), String> {
+    let mut current = state.lock().map_err(|_| "state unavailable")?;
+    finalize_local_state_for_exit(&mut current, chrono::Local::now());
+    save(&current, &storage_path(path)?)
+}
+
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn build_system_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+    use tauri::{
+        menu::{Menu, MenuItem},
+        tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    };
+
+    let open_item = MenuItem::with_id(app, "open", "FlowLens 열기", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "완전히 종료", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+
+    let _tray = TrayIconBuilder::with_id("flowlens-tray")
+        .tooltip("FlowLens · 로컬 활동 추적 실행 중")
+        .icon(app.default_window_icon().unwrap().clone())
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main_window(app),
+            "quit" => {
+                let state = app.state::<SharedState>();
+                let path = app.state::<SharedPath>();
+                let _ = persist_before_exit(&state, &path);
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 fn record_event(state: &mut TrackingState, at: String, app: String, title: String, kind: &str) {
     state.timeline.push(TimelineEvent { at, app, title, kind: kind.into() });
     if state.timeline.len() > MAX_TIMELINE { state.timeline.remove(0); }
@@ -1482,6 +1552,13 @@ fn clear_embedding_data(state: tauri::State<'_, SharedState>, path: tauri::State
 #[tauri::command]
 fn clear_all_data(state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<(), String> { let mut current = state.lock().map_err(|_| "state unavailable")?; let enabled = current.enabled; *current = TrackingState { enabled, ..Default::default() }; let file = storage_path(&path)?; if file.exists() { fs::remove_file(file).map_err(|e| e.to_string())?; } Ok(()) }
 #[tauri::command]
+fn exit_application(app: tauri::AppHandle, state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<(), String> {
+    persist_before_exit(&state, &path)?;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
 fn request_notification_access(state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<AdvancedCollectionState, String> { let mut current = state.lock().map_err(|_| "state unavailable")?; current.advanced.notification_requested = true; current.advanced.notification_access = "requires_msix_user_notification_listener_consent".into(); current.advanced.helper_last_error = "알림 수집은 관리자 권한이 아니라 MSIX 패키지 identity와 Windows 알림 접근 동의가 필요합니다.".into(); save(&current, &storage_path(&path)?)?; Ok(current.advanced.clone()) }
 #[tauri::command]
 fn request_per_app_network_collection(state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<AdvancedCollectionState, String> { let mut current = state.lock().map_err(|_| "state unavailable")?; current.advanced.per_app_network_requested = true; current.advanced.per_app_network_status = "admin_required_etw_helper_not_installed".into(); current.advanced.helper_last_error = "앱별 네트워크 바이트는 시스템 ETW 세션을 사용하므로 관리자 권한으로 설치되는 선택적 수집기가 필요합니다.".into(); save(&current, &storage_path(&path)?)?; Ok(current.advanced.clone()) }
@@ -1752,13 +1829,39 @@ fn start_tracker(_state: SharedState, _path: SharedPath) {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let state = Arc::new(Mutex::new(TrackingState::default())); let path = Arc::new(Mutex::new(PathBuf::new())); let setup_state = state.clone(); let setup_path = path.clone();
-    tauri::Builder::default().setup(move |app| {
-        let file = app.path().app_data_dir().map_err(|e| e.to_string())?.join("activity.json");
-        if let Ok(mut current) = setup_state.lock() { *current = load(&file); let now = chrono::Local::now(); rollover_if_needed(&mut current, now); if current.collection_day.is_empty() { current.collection_day = now.date_naive().to_string(); current.daily_feature.date = current.collection_day.clone(); } }
-        if let Ok(mut current_path) = setup_path.lock() { *current_path = file; }
-        start_tracker(setup_state.clone(), setup_path.clone()); Ok(())
-    }).manage(state).manage(path).invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_report, get_daily_report_history, set_daily_report_enabled, set_daily_work_mode_tag, set_flow_reflection, set_flow_reflection_enabled, clear_daily_report_history, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, request_notification_access, request_per_app_network_collection]).run(tauri::generate_context!()).expect("error while running FlowLens");
+    let state = Arc::new(Mutex::new(TrackingState::default()));
+    let path = Arc::new(Mutex::new(PathBuf::new()));
+    let setup_state = state.clone();
+    let setup_path = path.clone();
+    tauri::Builder::default()
+        .on_window_event(|window, event| {
+            if window.label() != "main" { return; }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .setup(move |app| {
+            let file = app.path().app_data_dir().map_err(|e| e.to_string())?.join("activity.json");
+            if let Ok(mut current) = setup_state.lock() {
+                *current = load(&file);
+                let now = chrono::Local::now();
+                rollover_if_needed(&mut current, now);
+                if current.collection_day.is_empty() {
+                    current.collection_day = now.date_naive().to_string();
+                    current.daily_feature.date = current.collection_day.clone();
+                }
+            }
+            if let Ok(mut current_path) = setup_path.lock() { *current_path = file; }
+            build_system_tray(app.handle())?;
+            start_tracker(setup_state.clone(), setup_path.clone());
+            Ok(())
+        })
+        .manage(state)
+        .manage(path)
+        .invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_report, get_daily_report_history, set_daily_report_enabled, set_daily_work_mode_tag, set_flow_reflection, set_flow_reflection_enabled, clear_daily_report_history, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, exit_application, request_notification_access, request_per_app_network_collection])
+        .run(tauri::generate_context!())
+        .expect("error while running FlowLens");
 }
 
 
@@ -1890,6 +1993,23 @@ mod daily_report_tests {
         let signal = report.strain.signals.iter().find(|item| item.code == "late_fragmentation").unwrap();
         assert!(matches!(signal.state.as_str(), "elevated" | "high"));
         assert!(report.report.headline.contains("변화 신호"));
+    }
+
+    #[test]
+    fn finalizes_live_session_before_explicit_app_exit() {
+        let mut state = TrackingState::default();
+        let now = chrono::Local::now();
+        state.collection_day = now.date_naive().to_string();
+        state.current_session_started_at = Some((now - chrono::Duration::minutes(12)).to_rfc3339());
+        state.current_session_active_seconds = 720;
+        state.current_session_switches = 3;
+        state.current_session_apps = vec!["editor.exe".into()];
+        state.active_window = "editor.exe".into();
+        finalize_local_state_for_exit(&mut state, now);
+        assert!(state.current_session_started_at.is_none());
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].end_reason.as_deref(), Some("app_exit"));
+        assert!(state.timeline.iter().any(|event| event.kind == "session_end_app_exit"));
     }
 
     #[test]
