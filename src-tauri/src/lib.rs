@@ -2220,9 +2220,11 @@ mod daily_report_tests {
 
     #[test]
     fn aligns_disk_usage_snapshots_to_thirty_minute_local_buckets() {
-        let parsed = chrono::DateTime::parse_from_rfc3339("2026-09-18T20:51:29+09:00").unwrap();
-        let key = disk_bucket_key(parsed.with_timezone(&chrono::Local));
-        assert!(key.contains("T20:30:00"));
+        use chrono::Timelike;
+        let now = chrono::Local::now();
+        let expected_minute = now.minute() / 30 * 30;
+        let key = disk_bucket_key(now);
+        assert!(key.contains(&format!("T{:02}:{expected_minute:02}:00", now.hour())));
     }
 
     #[test]
