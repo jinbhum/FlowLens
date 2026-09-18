@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -21,8 +21,10 @@ const REENTRY_MIN_BREAK_SECS: i64 = 3 * 60;
 const REENTRY_MAX_BREAK_SECS: i64 = 60 * 60;
 const REENTRY_OBSERVATION_SECS: i64 = 10 * 60;
 const MAX_EMBEDDING_HISTORY: usize = 365;
-const EMBEDDING_DIMENSIONS: usize = 24;
+const EMBEDDING_DIMENSIONS: usize = 25;
 const FOREGROUND_SAMPLE_MS: u64 = 200;
+const DISK_SNAPSHOT_INTERVAL_SECS: i64 = 30 * 60;
+const MAX_DISK_SNAPSHOTS: usize = 51_840;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -41,10 +43,21 @@ struct MinuteSnapshot {
     keyboard_actions: u64,
     mouse_actions: u64,
     mouse_distance_px: f64,
+    mouse_wheel_notches: u64,
     network_rx_bytes: u64,
     network_tx_bytes: u64,
     idle_seconds: u64,
     context_switches: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DiskUsageSnapshot {
+    at: String,
+    drive: String,
+    total_bytes: u64,
+    free_bytes: u64,
+    used_bytes: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -88,6 +101,7 @@ struct DailyFeatureVector {
     keyboard_events_per_active_minute: f64,
     mouse_distance_per_active_minute: f64,
     mouse_clicks_per_active_minute: f64,
+    mouse_wheel_notches_per_active_minute: f64,
     click_interval_variance_ms: f64,
     network_bytes_per_active_minute: f64,
     peak_focus_hour: u8,
@@ -139,6 +153,7 @@ struct EmbeddingAnalysis {
     baseline_similarity: Option<f64>,
     similar_days: Vec<SimilarDay>,
     insights: Vec<PatternInsight>,
+    last_workday_evaluation: Vec<String>,
     notice: String,
 }
 
@@ -422,6 +437,8 @@ struct TrackingState {
     active_app_count: u64,
     mouse_distance_px: f64,
     mouse_clicks: u64,
+    mouse_wheel_notches: u64,
+    disk_snapshots: Vec<DiskUsageSnapshot>,
     avg_click_interval_ms: u64,
     click_interval_count: u64,
     click_interval_mean_ms: f64,
@@ -459,7 +476,7 @@ impl Default for TrackingState {
             enabled: true, active_window: String::new(), keyboard_actions: 0, mouse_actions: 0,
             app_activation_count: 0, focus_seconds: 0, hourly_focus: [0; 24], apps: Vec::new(),
             timeline: Vec::new(), minute_snapshots: Vec::new(), flow_minutes: Vec::new(), active_app_count: 0,
-            mouse_distance_px: 0.0, mouse_clicks: 0, avg_click_interval_ms: 0,
+            mouse_distance_px: 0.0, mouse_clicks: 0, mouse_wheel_notches: 0, disk_snapshots: Vec::new(), avg_click_interval_ms: 0,
             click_interval_count: 0, click_interval_mean_ms: 0.0, click_interval_m2: 0.0,
             network_rx_bytes: 0, network_tx_bytes: 0, notification_count: 0, idle_seconds: 0,
             context_switches: 0, sessions: Vec::new(), current_session_started_at: None,
@@ -467,7 +484,7 @@ impl Default for TrackingState {
             current_session_switches: 0, current_session_apps: Vec::new(),
             last_input_at: None, last_input_age_seconds: 0, resume_latency_seconds: 0,
             collection_day: String::new(),
-            daily_feature: DailyFeatureVector { schema_version: 2, local_only: true, ..Default::default() },
+            daily_feature: DailyFeatureVector { schema_version: 3, local_only: true, ..Default::default() },
             embedding_enabled: false, embedding_history: Vec::new(),
             advanced: AdvancedCollectionState { notification_access: "not_requested".into(), per_app_network_status: "not_requested".into(), ..Default::default() },
             tracker_sample_interval_ms: FOREGROUND_SAMPLE_MS, unresolved_window_count: 0,
@@ -487,6 +504,18 @@ fn save(state: &TrackingState, path: &PathBuf) -> Result<(), String> {
     fs::rename(temp, path).map_err(|e| e.to_string())
 }
 fn load(path: &PathBuf) -> TrackingState { fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default() }
+
+fn migrate_local_state(state: &mut TrackingState) {
+    state.daily_feature.schema_version = state.daily_feature.schema_version.max(3);
+    for record in &mut state.embedding_history {
+        record.embedding.resize(EMBEDDING_DIMENSIONS, 0.0);
+        record.embedding.truncate(EMBEDDING_DIMENSIONS);
+        record.dimensions = EMBEDDING_DIMENSIONS;
+        record.schema_version = record.schema_version.max(2);
+        record.feature.schema_version = record.feature.schema_version.max(3);
+    }
+}
+
 fn storage_path(path: &SharedPath) -> Result<PathBuf, String> { path.lock().map(|value| value.clone()).map_err(|_| "storage path unavailable".into()) }
 
 
@@ -1302,7 +1331,7 @@ fn update_daily_feature(state: &mut TrackingState, now: chrono::DateTime<chrono:
     shares.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     shares.truncate(12);
     state.daily_feature = DailyFeatureVector {
-        schema_version: 2, date: now.date_naive().to_string(), focus_minutes, idle_minutes,
+        schema_version: 3, date: now.date_naive().to_string(), focus_minutes, idle_minutes,
         active_ratio: if total_minutes > 0.0 { focus_minutes / total_minutes } else { 0.0 },
         app_count: state.apps.len() as u64, context_switches: state.context_switches,
         switches_per_active_hour: if focus_minutes > 0.0 { state.context_switches as f64 / (focus_minutes / 60.0) } else { 0.0 },
@@ -1311,6 +1340,7 @@ fn update_daily_feature(state: &mut TrackingState, now: chrono::DateTime<chrono:
         keyboard_events_per_active_minute: if focus_minutes > 0.0 { state.keyboard_actions as f64 / focus_minutes } else { 0.0 },
         mouse_distance_per_active_minute: if focus_minutes > 0.0 { state.mouse_distance_px / focus_minutes } else { 0.0 },
         mouse_clicks_per_active_minute: if focus_minutes > 0.0 { state.mouse_clicks as f64 / focus_minutes } else { 0.0 },
+        mouse_wheel_notches_per_active_minute: if focus_minutes > 0.0 { state.mouse_wheel_notches as f64 / focus_minutes } else { 0.0 },
         click_interval_variance_ms: if state.click_interval_count > 1 { state.click_interval_m2 / (state.click_interval_count - 1) as f64 } else { 0.0 },
         network_bytes_per_active_minute: if focus_minutes > 0.0 { (state.network_rx_bytes + state.network_tx_bytes) as f64 / focus_minutes } else { 0.0 },
         peak_focus_hour: max_hour, work_start_hour: work_start, work_end_hour: work_end, work_span_hours,
@@ -1338,6 +1368,7 @@ fn build_embedding(feature: &DailyFeatureVector) -> Vec<f64> {
     vector[14] = feature.work_start_hour.map(|hour| hour as f64 / 23.0).unwrap_or(0.0);
     vector[15] = clamp(feature.work_span_hours, 16.0);
     for index in 0..8 { vector[16 + index] = feature.app_time_share.get(index).copied().unwrap_or(0.0).clamp(0.0, 1.0); }
+    vector[24] = clamp(feature.mouse_wheel_notches_per_active_minute, 100.0);
     vector
 }
 
@@ -1350,7 +1381,7 @@ fn cosine_similarity(left: &[f64], right: &[f64]) -> f64 {
 }
 
 fn make_embedding_record(feature: &DailyFeatureVector, now: chrono::DateTime<chrono::Local>) -> EmbeddingRecord {
-    EmbeddingRecord { schema_version: 1, date: feature.date.clone(), created_at: now.to_rfc3339(), dimensions: EMBEDDING_DIMENSIONS, embedding: build_embedding(feature), data_confidence: confidence(feature), feature: feature.clone() }
+    EmbeddingRecord { schema_version: 2, date: feature.date.clone(), created_at: now.to_rfc3339(), dimensions: EMBEDDING_DIMENSIONS, embedding: build_embedding(feature), data_confidence: confidence(feature), feature: feature.clone() }
 }
 
 fn upsert_current_embedding(state: &mut TrackingState, now: chrono::DateTime<chrono::Local>) {
@@ -1364,12 +1395,12 @@ fn upsert_current_embedding(state: &mut TrackingState, now: chrono::DateTime<chr
 fn reset_daily_activity(state: &mut TrackingState) {
     state.active_window.clear(); state.keyboard_actions = 0; state.mouse_actions = 0; state.app_activation_count = 0; state.focus_seconds = 0;
     state.hourly_focus = [0; 24]; state.apps.clear(); state.timeline.clear(); state.minute_snapshots.clear(); state.flow_minutes.clear(); state.active_app_count = 0;
-    state.mouse_distance_px = 0.0; state.mouse_clicks = 0; state.avg_click_interval_ms = 0; state.click_interval_count = 0;
+    state.mouse_distance_px = 0.0; state.mouse_clicks = 0; state.mouse_wheel_notches = 0; state.avg_click_interval_ms = 0; state.click_interval_count = 0;
     state.click_interval_mean_ms = 0.0; state.click_interval_m2 = 0.0; state.network_rx_bytes = 0; state.network_tx_bytes = 0;
     state.notification_count = 0; state.idle_seconds = 0; state.context_switches = 0; state.sessions.clear();
     state.current_session_started_at = None; state.current_session_active_seconds = 0; state.current_session_idle_seconds = 0;
     state.current_session_switches = 0; state.current_session_apps.clear(); state.last_input_at = None; state.last_input_age_seconds = 0;
-    state.resume_latency_seconds = 0; state.daily_feature = DailyFeatureVector { schema_version: 2, local_only: true, ..Default::default() };
+    state.resume_latency_seconds = 0; state.daily_feature = DailyFeatureVector { schema_version: 3, local_only: true, ..Default::default() };
     state.reentry_episodes.clear(); state.pending_reentry = None;
     state.report_settings.work_mode_tag = None; state.report_settings.flow_satisfaction = None;
 }
@@ -1399,9 +1430,49 @@ fn rollover_if_needed(state: &mut TrackingState, now: chrono::DateTime<chrono::L
 
 fn insight(level: &str, title: &str, detail: String) -> PatternInsight { PatternInsight { level: level.into(), title: title.into(), detail } }
 
+fn local_workday_evaluation(feature: &DailyFeatureVector, prior: &[&EmbeddingRecord], baseline_similarity: Option<f64>) -> Vec<String> {
+    if feature.focus_minutes < 15.0 { return Vec::new(); }
+    let mut lines = vec![format!(
+        "오늘은 집중 {:.0}분과 활성 비율 {:.0}%가 로컬 집계되었습니다.",
+        feature.focus_minutes,
+        feature.active_ratio * 100.0,
+    )];
+    lines.push(format!(
+        "{}개 세션의 평균 길이는 {:.1}분이며, 활성 1시간당 전환은 {:.1}회입니다.",
+        feature.session_count,
+        feature.average_session_minutes,
+        feature.switches_per_active_hour,
+    ));
+    if prior.is_empty() {
+        lines.push("비교 기준선은 이전 업무일이 축적되면 생성됩니다. 현재 평가는 오늘의 수치형 흐름만 반영합니다.".into());
+    } else {
+        let average_focus = prior.iter().map(|item| item.feature.focus_minutes).sum::<f64>() / prior.len() as f64;
+        let average_switches = prior.iter().map(|item| item.feature.switches_per_active_hour).sum::<f64>() / prior.len() as f64;
+        let focus_delta = feature.focus_minutes - average_focus;
+        let switch_delta = feature.switches_per_active_hour - average_switches;
+        let comparison = if focus_delta >= 10.0 {
+            format!("기준선보다 집중 시간이 {:.0}분 길고", focus_delta)
+        } else if focus_delta <= -10.0 {
+            format!("기준선보다 집중 시간이 {:.0}분 짧고", focus_delta.abs())
+        } else {
+            "기준선과 집중 시간이 비슷하고".into()
+        };
+        let switch_note = if switch_delta >= 2.0 {
+            format!(" 전환 밀도는 {:.1}회/h 높습니다.", switch_delta)
+        } else if switch_delta <= -2.0 {
+            format!(" 전환 밀도는 {:.1}회/h 낮습니다.", switch_delta.abs())
+        } else {
+            " 전환 밀도도 큰 차이가 없습니다.".into()
+        };
+        let similarity_note = baseline_similarity.map(|value| format!(" 패턴 유사도는 {:.0}%입니다.", value * 100.0)).unwrap_or_default();
+        lines.push(format!("{}{}{}", comparison, switch_note, similarity_note));
+    }
+    lines
+}
+
 fn analyze_embedding(state: &TrackingState) -> EmbeddingAnalysis {
     if !state.embedding_enabled {
-        return EmbeddingAnalysis { enabled: false, local_only: true, dimensions: EMBEDDING_DIMENSIONS, history_days: state.embedding_history.len(), notice: "임베딩 분석이 꺼져 있습니다. 활성화하면 수치형 특징 24개만 이 기기에 저장해 유사 업무일과 기준선을 비교합니다.".into(), ..Default::default() };
+        return EmbeddingAnalysis { enabled: false, local_only: true, dimensions: EMBEDDING_DIMENSIONS, history_days: state.embedding_history.len(), notice: "임베딩 분석이 꺼져 있습니다. 활성화하면 수치형 특징 25개만 이 기기에 저장해 유사 업무일과 기준선을 비교합니다.".into(), ..Default::default() };
     }
     let current = make_embedding_record(&state.daily_feature, chrono::Local::now());
     if current.feature.focus_minutes <= 0.0 {
@@ -1436,7 +1507,8 @@ fn analyze_embedding(state: &TrackingState) -> EmbeddingAnalysis {
     if current.feature.app_time_share.first().copied().unwrap_or(0.0) >= 0.70 { insights.push(insight("positive", "단일 도구 집중", format!("가장 큰 앱 시간 비율이 {:.0}%입니다. 앱 이름이 아닌 사용 시간 비율만 분석했습니다.", current.feature.app_time_share[0] * 100.0))); }
     if current.feature.session_count >= 6 && current.feature.average_session_minutes <= 12.0 { insights.push(insight("attention", "짧게 분할된 세션", format!("{}개 세션의 평균 길이가 {:.1}분입니다. 짧은 재개와 전환이 반복되고 있습니다.", current.feature.session_count, current.feature.average_session_minutes))); }
     if insights.is_empty() { insights.push(insight("neutral", "기준선 학습 중", "이전 업무일이 더 쌓이면 현재 패턴과 기준선의 차이를 설명 가능한 지표로 제시합니다.".into())); }
-    EmbeddingAnalysis { enabled: true, local_only: true, dimensions: EMBEDDING_DIMENSIONS, history_days: state.embedding_history.len(), current: Some(current), baseline_similarity, similar_days: similar, insights, notice: if prior.is_empty() { "첫 번째 로컬 임베딩입니다. 하루 이상 기록하면 유사 업무일과 개인 기준선을 비교할 수 있습니다.".into() } else { "분석은 이 기기에서 계산되며, 창 제목·키 입력·URL·화면 내용은 임베딩에 포함되지 않습니다.".into() } }
+    let last_workday_evaluation = local_workday_evaluation(&current.feature, &prior, baseline_similarity);
+    EmbeddingAnalysis { enabled: true, local_only: true, dimensions: EMBEDDING_DIMENSIONS, history_days: state.embedding_history.len(), current: Some(current), baseline_similarity, similar_days: similar, insights, last_workday_evaluation, notice: if prior.is_empty() { "첫 번째 로컬 임베딩입니다. 하루 이상 기록하면 유사 업무일과 개인 기준선을 비교할 수 있습니다.".into() } else { "분석은 이 기기에서 계산되며, 창 제목·키 입력·URL·화면 내용은 임베딩에 포함되지 않습니다.".into() } }
 }
 
 #[tauri::command]
@@ -1644,6 +1716,120 @@ fn network_totals() -> (u64, u64) {
 #[cfg(not(windows))]
 fn network_totals() -> (u64, u64) { (0, 0) }
 
+fn disk_bucket_key(now: chrono::DateTime<chrono::Local>) -> String {
+    use chrono::Timelike;
+    let elapsed_seconds_in_hour = now.minute() * 60 + now.second();
+    let bucket_start_seconds = elapsed_seconds_in_hour / DISK_SNAPSHOT_INTERVAL_SECS as u32 * DISK_SNAPSHOT_INTERVAL_SECS as u32;
+    let minute = bucket_start_seconds / 60;
+    format!("{}T{:02}:{:02}:00{}", now.format("%Y-%m-%d"), now.hour(), minute, now.format("%:z"))
+}
+
+#[cfg(windows)]
+fn mounted_disk_usage(at: &str) -> Vec<DiskUsageSnapshot> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetLogicalDriveStringsW};
+
+    let mut buffer = [0u16; 2048];
+    let written = unsafe { GetLogicalDriveStringsW(Some(&mut buffer)) } as usize;
+    if written == 0 || written >= buffer.len() { return Vec::new(); }
+    buffer[..written]
+        .split(|unit| *unit == 0)
+        .filter(|drive| !drive.is_empty())
+        .filter_map(|drive_units| {
+            let drive = String::from_utf16_lossy(drive_units);
+            let wide: Vec<u16> = drive.encode_utf16().chain(std::iter::once(0)).collect();
+            let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
+            unsafe {
+                GetDiskFreeSpaceExW(
+                    PCWSTR(wide.as_ptr()),
+                    Some(&mut available),
+                    Some(&mut total),
+                    Some(&mut free),
+                ).ok()?;
+            }
+            if total == 0 { return None; }
+            Some(DiskUsageSnapshot {
+                at: at.to_string(),
+                drive,
+                total_bytes: total,
+                free_bytes: free,
+                used_bytes: total.saturating_sub(free),
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn mounted_disk_usage(_at: &str) -> Vec<DiskUsageSnapshot> { Vec::new() }
+
+fn record_disk_snapshots(state: &mut TrackingState, now: chrono::DateTime<chrono::Local>) {
+    let at = disk_bucket_key(now);
+    let snapshots = mounted_disk_usage(&at);
+    if snapshots.is_empty() { return; }
+    state.disk_snapshots.retain(|item| item.at != at);
+    state.disk_snapshots.extend(snapshots);
+    if state.disk_snapshots.len() > MAX_DISK_SNAPSHOTS {
+        let overflow = state.disk_snapshots.len() - MAX_DISK_SNAPSHOTS;
+        state.disk_snapshots.drain(0..overflow);
+    }
+}
+
+#[cfg(windows)]
+static WHEEL_TRACKER_STATE: OnceLock<SharedState> = OnceLock::new();
+#[cfg(windows)]
+static WHEEL_TRACKER_INPUT_CLOCK: OnceLock<Arc<Mutex<Instant>>> = OnceLock::new();
+
+#[cfg(windows)]
+unsafe extern "system" fn wheel_hook_proc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, MSLLHOOKSTRUCT, WM_MOUSEWHEEL};
+    if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL && lparam.0 != 0 {
+        let hook = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        let delta = ((hook.mouseData >> 16) as u16) as i16;
+        let notches = ((i32::from(delta)).unsigned_abs() as u64).saturating_add(119) / 120;
+        if notches > 0 {
+            let now = chrono::Local::now();
+            if let Some(state) = WHEEL_TRACKER_STATE.get() {
+                if let Ok(mut current) = state.lock() {
+                    if current.enabled {
+                        current.mouse_wheel_notches = current.mouse_wheel_notches.saturating_add(notches);
+                        current.mouse_actions = current.mouse_actions.saturating_add(notches);
+                        record_flow_input(&mut current, now, 0, notches.min(u32::MAX as u64) as u32, 0.0);
+                        current.last_input_at = Some(now.to_rfc3339());
+                        current.last_input_age_seconds = 0;
+                    }
+                }
+            }
+            if let Some(clock) = WHEEL_TRACKER_INPUT_CLOCK.get() {
+                if let Ok(mut recorded) = clock.lock() { *recorded = Instant::now(); }
+            }
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
+#[cfg(windows)]
+fn start_wheel_tracker(state: SharedState, input_clock: Arc<Mutex<Instant>>) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+        MSG, WH_MOUSE_LL,
+    };
+    let _ = WHEEL_TRACKER_STATE.set(state);
+    let _ = WHEEL_TRACKER_INPUT_CLOCK.set(input_clock);
+    thread::spawn(|| unsafe {
+        let Ok(hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(wheel_hook_proc), None, 0) else { return; };
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        let _ = UnhookWindowsHookEx(hook);
+    });
+}
+
 #[cfg(windows)]
 fn start_tracker(state: SharedState, path: SharedPath) {
     use chrono::{Local, Timelike};
@@ -1662,7 +1848,9 @@ fn start_tracker(state: SharedState, path: SharedPath) {
         let mut last_save = Instant::now();
         let mut last_minute = Local::now().minute();
         let mut previous_network = network_totals();
-        let mut last_input = Instant::now();
+        let mut last_disk_bucket = String::new();
+        let input_clock = Arc::new(Mutex::new(Instant::now()));
+        start_wheel_tracker(state.clone(), input_clock.clone());
         let mut process_cache: HashMap<u32, (String, bool)> = HashMap::new();
         loop {
             thread::sleep(Duration::from_millis(50));
@@ -1719,16 +1907,16 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                 }
                 record_flow_input(&mut current, input_now, key_presses, flow_mouse_actions, flow_mouse_distance_px);
                 if input_seen {
-                    last_input = Instant::now();
+                    if let Ok(mut recorded) = input_clock.lock() { *recorded = Instant::now(); }
                     current.last_input_at = Some(input_now.to_rfc3339());
                     current.last_input_age_seconds = 0;
-                } else { current.last_input_age_seconds = last_input.elapsed().as_secs(); }
+                } else { current.last_input_age_seconds = input_clock.lock().map(|recorded| recorded.elapsed().as_secs()).unwrap_or(0); }
             }
 
             if last_foreground_sample.elapsed() >= Duration::from_millis(FOREGROUND_SAMPLE_MS) {
                 let elapsed_ms = last_foreground_sample.elapsed().as_millis().min(1_000) as u64;
                 let now = Local::now();
-                let idle = last_input.elapsed().as_secs() >= IDLE_THRESHOLD_SECS;
+                let idle = input_clock.lock().map(|recorded| recorded.elapsed().as_secs()).unwrap_or(0) >= IDLE_THRESHOLD_SECS;
                 let foreground = foreground_window(&mut process_cache);
                 if let Ok(mut current) = state.lock() {
                     rollover_if_needed(&mut current, now);
@@ -1759,7 +1947,7 @@ fn start_tracker(state: SharedState, path: SharedPath) {
 
             if last_second.elapsed() >= Duration::from_secs(1) {
                 let now = Local::now();
-                let idle = last_input.elapsed().as_secs() >= IDLE_THRESHOLD_SECS;
+                let idle = input_clock.lock().map(|recorded| recorded.elapsed().as_secs()).unwrap_or(0) >= IDLE_THRESHOLD_SECS;
                 if let Ok(mut current) = state.lock() {
                     rollover_if_needed(&mut current, now);
                     if idle {
@@ -1793,6 +1981,14 @@ fn start_tracker(state: SharedState, path: SharedPath) {
             }
 
             let now = Local::now();
+            let disk_bucket = disk_bucket_key(now);
+            if disk_bucket != last_disk_bucket {
+                if let Ok(mut current) = state.lock() {
+                    rollover_if_needed(&mut current, now);
+                    record_disk_snapshots(&mut current, now);
+                }
+                last_disk_bucket = disk_bucket;
+            }
             if now.minute() != last_minute {
                 let network = network_totals();
                 let received_delta = network.0.saturating_sub(previous_network.0);
@@ -1802,7 +1998,7 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                     current.active_app_count = visible_app_count();
                     current.network_rx_bytes = current.network_rx_bytes.saturating_add(received_delta);
                     current.network_tx_bytes = current.network_tx_bytes.saturating_add(sent_delta);
-                    let snapshot = MinuteSnapshot { at: now.to_rfc3339(), active_app_count: current.active_app_count, focus_seconds: current.focus_seconds, keyboard_actions: current.keyboard_actions, mouse_actions: current.mouse_actions, mouse_distance_px: current.mouse_distance_px, network_rx_bytes: current.network_rx_bytes, network_tx_bytes: current.network_tx_bytes, idle_seconds: current.idle_seconds, context_switches: current.context_switches };
+                    let snapshot = MinuteSnapshot { at: now.to_rfc3339(), active_app_count: current.active_app_count, focus_seconds: current.focus_seconds, keyboard_actions: current.keyboard_actions, mouse_actions: current.mouse_actions, mouse_distance_px: current.mouse_distance_px, mouse_wheel_notches: current.mouse_wheel_notches, network_rx_bytes: current.network_rx_bytes, network_tx_bytes: current.network_tx_bytes, idle_seconds: current.idle_seconds, context_switches: current.context_switches };
                     current.minute_snapshots.push(snapshot);
                     if current.minute_snapshots.len() > MAX_MINUTE_SNAPSHOTS { current.minute_snapshots.remove(0); }
                     refresh_reentry_episodes(&mut current, now);
@@ -1845,6 +2041,7 @@ pub fn run() {
             let file = app.path().app_data_dir().map_err(|e| e.to_string())?.join("activity.json");
             if let Ok(mut current) = setup_state.lock() {
                 *current = load(&file);
+                migrate_local_state(&mut current);
                 let now = chrono::Local::now();
                 rollover_if_needed(&mut current, now);
                 if current.collection_day.is_empty() {
@@ -1993,6 +2190,39 @@ mod daily_report_tests {
         let signal = report.strain.signals.iter().find(|item| item.code == "late_fragmentation").unwrap();
         assert!(matches!(signal.state.as_str(), "elevated" | "high"));
         assert!(report.report.headline.contains("변화 신호"));
+    }
+
+    #[test]
+    fn adds_wheel_density_as_the_twenty_fifth_local_embedding_dimension() {
+        let feature = DailyFeatureVector { mouse_wheel_notches_per_active_minute: 20.0, ..Default::default() };
+        let vector = build_embedding(&feature);
+        assert_eq!(vector.len(), EMBEDDING_DIMENSIONS);
+        assert_eq!(vector[24], 0.2);
+    }
+
+    #[test]
+    fn produces_three_line_local_workday_evaluation_with_sufficient_activity() {
+        let feature = DailyFeatureVector {
+            focus_minutes: 90.0, active_ratio: 0.75, session_count: 3,
+            average_session_minutes: 30.0, switches_per_active_hour: 4.0,
+            ..Default::default()
+        };
+        let prior = EmbeddingRecord {
+            dimensions: EMBEDDING_DIMENSIONS,
+            embedding: vec![0.0; EMBEDDING_DIMENSIONS],
+            feature: DailyFeatureVector { focus_minutes: 70.0, switches_per_active_hour: 6.0, ..Default::default() },
+            ..Default::default()
+        };
+        let lines = local_workday_evaluation(&feature, &[&prior], Some(0.88));
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| !line.is_empty()));
+    }
+
+    #[test]
+    fn aligns_disk_usage_snapshots_to_thirty_minute_local_buckets() {
+        let parsed = chrono::DateTime::parse_from_rfc3339("2026-09-18T20:51:29+09:00").unwrap();
+        let key = disk_bucket_key(parsed.with_timezone(&chrono::Local));
+        assert!(key.contains("T20:30:00"));
     }
 
     #[test]
