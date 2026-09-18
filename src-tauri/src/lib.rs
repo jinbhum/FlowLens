@@ -14,7 +14,12 @@ const MAX_TIMELINE: usize = 10_000;
 const MAX_MINUTE_SNAPSHOTS: usize = 43_200;
 const MAX_FLOW_MINUTES: usize = 1_440;
 const MAX_SESSIONS: usize = 500;
+const MAX_DAILY_REPORTS: usize = 365;
+const MAX_REENTRY_EPISODES: usize = 64;
 const FOCUS_BUCKET_MINUTES: u8 = 5;
+const REENTRY_MIN_BREAK_SECS: i64 = 3 * 60;
+const REENTRY_MAX_BREAK_SECS: i64 = 60 * 60;
+const REENTRY_OBSERVATION_SECS: i64 = 10 * 60;
 const MAX_EMBEDDING_HISTORY: usize = 365;
 const EMBEDDING_DIMENSIONS: usize = 24;
 const FOREGROUND_SAMPLE_MS: u64 = 200;
@@ -147,6 +152,190 @@ struct AdvancedCollectionState {
     helper_last_error: String,
 }
 
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct PendingReentry {
+    break_started_at: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct ReentryEpisode {
+    id: String,
+    break_started_at: String,
+    resumed_at: String,
+    break_seconds: u64,
+    stabilization_seconds: Option<u64>,
+    focused_seconds_first_10m: u16,
+    switch_count_first_10m: u16,
+    finalized: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct ReportSettings {
+    enabled: bool,
+    work_mode_tag: Option<String>,
+    reflection_enabled: bool,
+    flow_satisfaction: Option<u8>,
+    reminder_enabled: bool,
+}
+
+impl Default for ReportSettings {
+    fn default() -> Self {
+        Self { enabled: false, work_mode_tag: None, reflection_enabled: false, flow_satisfaction: None, reminder_enabled: false }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DailyContext {
+    work_mode_tag: Option<String>,
+    reflection_enabled: bool,
+    flow_satisfaction: Option<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct ReportDataQuality {
+    observed_minutes: u16,
+    active_minutes: u16,
+    observed_coverage: f32,
+    session_count: u16,
+    reentry_episode_count: u16,
+    comparison_sample_count: u16,
+    level: String,
+    limitations: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DailyFlowMetrics {
+    focus_seconds: u64,
+    idle_seconds: u64,
+    active_ratio: f32,
+    work_span_minutes: u16,
+    session_count: u16,
+    median_session_seconds: u32,
+    longest_session_seconds: u32,
+    long_form_focus_share: f32,
+    switch_count: u32,
+    switches_per_active_hour: f32,
+    short_session_share: f32,
+    input_density_cv: Option<f32>,
+    extended_session_count: u16,
+    short_break_after_extended_count: u16,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DayPartMetrics {
+    part: String,
+    observed_seconds: u32,
+    focus_seconds: u32,
+    idle_seconds: u32,
+    switch_count: u16,
+    input_actions: u32,
+    focused_bucket_share: f32,
+    switches_per_active_hour: f32,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct ReentryMetrics {
+    analyzable_episode_count: u16,
+    median_break_seconds: Option<u32>,
+    median_stabilization_seconds: Option<u32>,
+    stabilization_missing_share: Option<f32>,
+    post_resume_switches_per_episode: Option<f32>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct EvidenceValue {
+    metric: String,
+    value: f64,
+    unit: String,
+    baseline_median: Option<f64>,
+    baseline_sample_count: u16,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct ReportInsight {
+    code: String,
+    level: String,
+    title: String,
+    detail: String,
+    evidence: Vec<EvidenceValue>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DailyReportContent {
+    headline: String,
+    highlights: Vec<ReportInsight>,
+    observations: Vec<ReportInsight>,
+    limitations: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct BaselineDescriptor {
+    cohort: String,
+    sample_count: u16,
+    date_range_start: Option<String>,
+    date_range_end: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct FlowStrainSignal {
+    code: String,
+    label: String,
+    state: String,
+    current_value: Option<f64>,
+    baseline_median: Option<f64>,
+    robust_delta: Option<f32>,
+    evidence: Vec<EvidenceValue>,
+    explanation: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct FlowStrainAssessment {
+    eligible: bool,
+    baseline: BaselineDescriptor,
+    signals: Vec<FlowStrainSignal>,
+    signal_count: u8,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DailyReportRecord {
+    schema_version: u32,
+    date: String,
+    generated_at: String,
+    status: String,
+    data_quality: ReportDataQuality,
+    context: DailyContext,
+    metrics: DailyFlowMetrics,
+    day_parts: Vec<DayPartMetrics>,
+    reentry: ReentryMetrics,
+    strain: FlowStrainAssessment,
+    report: DailyReportContent,
+}
+
+#[derive(Clone, Serialize)]
+struct DailyReportListItem {
+    date: String,
+    status: String,
+    headline: String,
+    data_quality_level: String,
+    signal_count: u8,
+    work_mode_tag: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 struct FocusExperienceView {
     schema_version: u32,
@@ -258,6 +447,10 @@ struct TrackingState {
     advanced: AdvancedCollectionState,
     tracker_sample_interval_ms: u64,
     unresolved_window_count: u64,
+    reentry_episodes: Vec<ReentryEpisode>,
+    pending_reentry: Option<PendingReentry>,
+    daily_reports: Vec<DailyReportRecord>,
+    report_settings: ReportSettings,
 }
 
 impl Default for TrackingState {
@@ -278,6 +471,7 @@ impl Default for TrackingState {
             embedding_enabled: false, embedding_history: Vec::new(),
             advanced: AdvancedCollectionState { notification_access: "not_requested".into(), per_app_network_status: "not_requested".into(), ..Default::default() },
             tracker_sample_interval_ms: FOREGROUND_SAMPLE_MS, unresolved_window_count: 0,
+            reentry_episodes: Vec::new(), pending_reentry: None, daily_reports: Vec::new(), report_settings: ReportSettings::default(),
         }
     }
 }
@@ -522,6 +716,485 @@ fn build_focus_experience_view(state: &TrackingState, date: &str, bucket_minutes
     }
 }
 
+
+fn parse_local_timestamp(value: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(value).ok()
+}
+
+fn report_date_matches(value: &str, date: &str) -> bool { value.starts_with(date) }
+
+fn minute_of_day(item: &FlowMinute) -> Option<usize> {
+    use chrono::Timelike;
+    let timestamp = parse_local_timestamp(&item.start_at)?;
+    Some(timestamp.hour() as usize * 60 + timestamp.minute() as usize)
+}
+
+fn flow_minutes_for_date<'a>(state: &'a TrackingState, date: &str) -> Vec<&'a FlowMinute> {
+    let mut minutes: Vec<&FlowMinute> = state.flow_minutes.iter().filter(|item| report_date_matches(&item.start_at, date)).collect();
+    minutes.sort_by_key(|item| minute_of_day(item).unwrap_or(usize::MAX));
+    minutes
+}
+
+fn daily_sessions_for_date(state: &TrackingState, date: &str) -> Vec<WorkSession> {
+    let mut sessions: Vec<WorkSession> = state.sessions.iter()
+        .filter(|session| report_date_matches(&session.started_at, date))
+        .cloned().collect();
+    if let Some(started_at) = state.current_session_started_at.as_ref().filter(|value| report_date_matches(value, date)) {
+        sessions.push(WorkSession {
+            started_at: started_at.clone(), ended_at: None,
+            active_seconds: state.current_session_active_seconds,
+            idle_seconds: state.current_session_idle_seconds,
+            switch_count: state.current_session_switches,
+            app_count: state.current_session_apps.len() as u64,
+            end_reason: None,
+        });
+    }
+    sessions.sort_by(|left, right| left.started_at.cmp(&right.started_at));
+    sessions
+}
+
+fn median_f64(mut values: Vec<f64>) -> Option<f64> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() { return None; }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 { Some((values[middle - 1] + values[middle]) / 2.0) } else { Some(values[middle]) }
+}
+
+fn median_u64(values: Vec<u64>) -> Option<u64> { median_f64(values.into_iter().map(|value| value as f64).collect()).map(|value| value.round() as u64) }
+
+fn coefficient_of_variation(values: &[f64]) -> Option<f32> {
+    if values.len() < 2 { return None; }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    if mean <= 0.0 { return None; }
+    let variance = values.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    Some((variance.sqrt() / mean) as f32)
+}
+
+fn day_part(hour: usize) -> &'static str {
+    match hour {
+        5..=10 => "morning",
+        11..=13 => "midday",
+        14..=17 => "afternoon",
+        _ => "evening",
+    }
+}
+
+fn day_part_index(name: &str) -> usize {
+    match name { "morning" => 0, "midday" => 1, "afternoon" => 2, _ => 3 }
+}
+
+fn current_daily_context(state: &TrackingState) -> DailyContext {
+    DailyContext {
+        work_mode_tag: state.report_settings.work_mode_tag.clone(),
+        reflection_enabled: state.report_settings.reflection_enabled,
+        flow_satisfaction: if state.report_settings.reflection_enabled { state.report_settings.flow_satisfaction } else { None },
+    }
+}
+
+fn bucket_accumulators_for_date(state: &TrackingState, date: &str) -> Vec<FlowBucketAccumulator> {
+    let mut buckets = vec![FlowBucketAccumulator::default(); 1_440 / FOCUS_BUCKET_MINUTES as usize];
+    for minute in flow_minutes_for_date(state, date) {
+        if let Some(slot) = flow_minute_slot(minute, date, FOCUS_BUCKET_MINUTES) {
+            if let Some(bucket) = buckets.get_mut(slot) {
+                bucket.observed_seconds = bucket.observed_seconds.saturating_add(minute.observed_seconds as u32);
+                bucket.focus_seconds = bucket.focus_seconds.saturating_add(minute.focus_seconds as u32);
+                bucket.idle_seconds = bucket.idle_seconds.saturating_add(minute.idle_seconds as u32);
+                bucket.switch_count = bucket.switch_count.saturating_add(minute.switch_count as u32);
+                bucket.input_actions = bucket.input_actions.saturating_add(minute.keyboard_actions.saturating_add(minute.mouse_actions));
+            }
+        }
+    }
+    buckets
+}
+
+fn assess_report_data_quality(state: &TrackingState, date: &str) -> ReportDataQuality {
+    let minutes = flow_minutes_for_date(state, date);
+    let observed_seconds = minutes.iter().map(|item| item.observed_seconds as u64).sum::<u64>();
+    let active_seconds = minutes.iter().map(|item| item.focus_seconds as u64).sum::<u64>();
+    let observed_slots: Vec<usize> = minutes.iter().filter(|item| item.observed_seconds > 0).filter_map(|item| minute_of_day(item)).collect();
+    let span_seconds = match (observed_slots.iter().min(), observed_slots.iter().max()) {
+        (Some(start), Some(end)) => ((end - start + 1) * 60) as u64,
+        _ => 0,
+    };
+    let coverage = if span_seconds > 0 { (observed_seconds as f64 / span_seconds as f64).clamp(0.0, 1.0) as f32 } else { 0.0 };
+    let observed_buckets = bucket_accumulators_for_date(state, date).iter().filter(|bucket| bucket.observed_seconds >= 30).count();
+    let completed_sessions = state.sessions.iter().filter(|session| report_date_matches(&session.started_at, date)).count();
+    let finalized_reentries = state.reentry_episodes.iter().filter(|episode| report_date_matches(&episode.resumed_at, date) && episode.finalized).count();
+    let level = if observed_seconds < 60 * 60 || observed_buckets < 12 { "insufficient" }
+        else if observed_seconds < 120 * 60 || completed_sessions < 2 || coverage < 0.60 { "partial" }
+        else { "sufficient" };
+    let mut limitations = Vec::new();
+    if observed_seconds < 60 * 60 { limitations.push("관측된 활동 시간이 60분 미만이어서 개인 비교를 만들지 않았습니다.".into()); }
+    if observed_buckets < 12 { limitations.push("5분 흐름 버킷이 충분하지 않아 시간대 비교의 신뢰도가 낮습니다.".into()); }
+    if coverage < 0.60 && observed_seconds >= 60 * 60 { limitations.push("첫 관측부터 마지막 관측까지의 시간 중 실제 관측 비율이 낮습니다.".into()); }
+    if completed_sessions < 2 && observed_seconds >= 60 * 60 { limitations.push("완료된 세션이 2개 미만이어서 세션 구조 비교를 제한합니다.".into()); }
+    ReportDataQuality {
+        observed_minutes: ((observed_seconds + 59) / 60).min(u16::MAX as u64) as u16,
+        active_minutes: ((active_seconds + 59) / 60).min(u16::MAX as u64) as u16,
+        observed_coverage: coverage,
+        session_count: completed_sessions.min(u16::MAX as usize) as u16,
+        reentry_episode_count: finalized_reentries.min(u16::MAX as usize) as u16,
+        comparison_sample_count: 0,
+        level: level.into(),
+        limitations,
+    }
+}
+
+fn aggregate_daily_flow_metrics(state: &TrackingState, date: &str) -> DailyFlowMetrics {
+    let minutes = flow_minutes_for_date(state, date);
+    let focus_seconds = minutes.iter().map(|item| item.focus_seconds as u64).sum::<u64>();
+    let idle_seconds = minutes.iter().map(|item| item.idle_seconds as u64).sum::<u64>();
+    let switch_count = minutes.iter().map(|item| item.switch_count as u64).sum::<u64>();
+    let minute_slots: Vec<usize> = minutes.iter().filter(|item| item.observed_seconds > 0).filter_map(|item| minute_of_day(item)).collect();
+    let work_span_minutes = match (minute_slots.iter().min(), minute_slots.iter().max()) {
+        (Some(start), Some(end)) => (end - start + 1).min(u16::MAX as usize) as u16,
+        _ => 0,
+    };
+    let sessions = daily_sessions_for_date(state, date);
+    let session_lengths: Vec<u64> = sessions.iter().map(|session| session.active_seconds).collect();
+    let session_seconds = session_lengths.iter().sum::<u64>();
+    let long_form_seconds = sessions.iter().filter(|session| session.active_seconds >= 25 * 60).map(|session| session.active_seconds).sum::<u64>();
+    let short_sessions = sessions.iter().filter(|session| session.active_seconds < 10 * 60).count();
+    let extended_session_count = sessions.iter().filter(|session| session.active_seconds >= 90 * 60).count() as u16;
+    let mut short_break_after_extended_count = 0u16;
+    for pair in sessions.windows(2) {
+        if pair[0].active_seconds < 90 * 60 { continue; }
+        if let (Some(ended), Some(next)) = (parse_local_timestamp(pair[0].ended_at.as_deref().unwrap_or("")), parse_local_timestamp(&pair[1].started_at)) {
+            let gap = next.timestamp().saturating_sub(ended.timestamp());
+            if (0..15 * 60).contains(&gap) { short_break_after_extended_count = short_break_after_extended_count.saturating_add(1); }
+        }
+    }
+    let input_densities: Vec<f64> = bucket_accumulators_for_date(state, date).iter()
+        .filter(|bucket| bucket.observed_seconds >= 30)
+        .map(|bucket| bucket.input_actions as f64 / (bucket.observed_seconds as f64 / 60.0).max(1.0))
+        .collect();
+    DailyFlowMetrics {
+        focus_seconds,
+        idle_seconds,
+        active_ratio: (if focus_seconds + idle_seconds > 0 { focus_seconds as f64 / (focus_seconds + idle_seconds) as f64 } else { 0.0 }) as f32,
+        work_span_minutes,
+        session_count: sessions.len().min(u16::MAX as usize) as u16,
+        median_session_seconds: median_u64(session_lengths.clone()).unwrap_or(0).min(u32::MAX as u64) as u32,
+        longest_session_seconds: session_lengths.iter().copied().max().unwrap_or(0).min(u32::MAX as u64) as u32,
+        long_form_focus_share: (if session_seconds > 0 { long_form_seconds as f64 / session_seconds as f64 } else { 0.0 }) as f32,
+        switch_count: switch_count.min(u32::MAX as u64) as u32,
+        switches_per_active_hour: (if focus_seconds > 0 { switch_count as f64 / (focus_seconds as f64 / 3600.0) } else { 0.0 }) as f32,
+        short_session_share: (if sessions.is_empty() { 0.0 } else { short_sessions as f64 / sessions.len() as f64 }) as f32,
+        input_density_cv: coefficient_of_variation(&input_densities),
+        extended_session_count,
+        short_break_after_extended_count,
+    }
+}
+
+fn aggregate_day_parts(state: &TrackingState, date: &str) -> Vec<DayPartMetrics> {
+    let mut parts = vec![DayPartMetrics { part: "morning".into(), ..Default::default() }, DayPartMetrics { part: "midday".into(), ..Default::default() }, DayPartMetrics { part: "afternoon".into(), ..Default::default() }, DayPartMetrics { part: "evening".into(), ..Default::default() }];
+    for minute in flow_minutes_for_date(state, date) {
+        if let Some(slot) = minute_of_day(minute) {
+            let part = &mut parts[day_part_index(day_part(slot / 60))];
+            part.observed_seconds = part.observed_seconds.saturating_add(minute.observed_seconds as u32);
+            part.focus_seconds = part.focus_seconds.saturating_add(minute.focus_seconds as u32);
+            part.idle_seconds = part.idle_seconds.saturating_add(minute.idle_seconds as u32);
+            part.switch_count = part.switch_count.saturating_add(minute.switch_count);
+            part.input_actions = part.input_actions.saturating_add(minute.keyboard_actions.saturating_add(minute.mouse_actions));
+        }
+    }
+    let buckets = bucket_accumulators_for_date(state, date);
+    let mut observed_buckets = [0u32; 4];
+    let mut focused_buckets = [0u32; 4];
+    for (index, bucket) in buckets.iter().enumerate() {
+        let part_index = day_part_index(day_part((index * FOCUS_BUCKET_MINUTES as usize) / 60));
+        if bucket.observed_seconds >= 30 {
+            observed_buckets[part_index] = observed_buckets[part_index].saturating_add(1);
+            if flow_state_and_intensity(bucket).0 == "focused" { focused_buckets[part_index] = focused_buckets[part_index].saturating_add(1); }
+        }
+    }
+    for (index, part) in parts.iter_mut().enumerate() {
+        part.focused_bucket_share = if observed_buckets[index] > 0 { focused_buckets[index] as f32 / observed_buckets[index] as f32 } else { 0.0 };
+        part.switches_per_active_hour = (if part.focus_seconds > 0 { part.switch_count as f64 / (part.focus_seconds as f64 / 3600.0) } else { 0.0 }) as f32;
+    }
+    parts
+}
+
+fn reentry_outcome(flow_minutes: &[FlowMinute], episode: &ReentryEpisode, now: chrono::DateTime<chrono::Local>) -> Option<(Option<u64>, u16, u16, bool)> {
+    use chrono::Timelike;
+    let resumed = parse_local_timestamp(&episode.resumed_at)?;
+    let date = resumed.date_naive().to_string();
+    let start_slot = resumed.hour() as usize * 60 + resumed.minute() as usize;
+    let mut by_slot: HashMap<usize, &FlowMinute> = HashMap::new();
+    for minute in flow_minutes.iter().filter(|item| report_date_matches(&item.start_at, &date)) {
+        if let Some(slot) = minute_of_day(minute) { by_slot.insert(slot, minute); }
+    }
+    let mut focused_seconds = 0u16;
+    let mut switches = 0u16;
+    let mut focused_streak = 0usize;
+    let mut stabilization = None;
+    for offset in 0..10usize {
+        let item = by_slot.get(&(start_slot + offset));
+        let is_focused = item.map(|minute| minute.observed_seconds >= 30 && minute.focus_seconds as f32 / minute.observed_seconds.max(1) as f32 >= 0.75 && minute.switch_count <= 1).unwrap_or(false);
+        if let Some(minute) = item {
+            focused_seconds = focused_seconds.saturating_add(minute.focus_seconds);
+            switches = switches.saturating_add(minute.switch_count);
+        }
+        if is_focused {
+            focused_streak += 1;
+            if focused_streak >= 5 && stabilization.is_none() { stabilization = Some(((offset + 1) * 60) as u64); }
+        } else { focused_streak = 0; }
+    }
+    let finalized = now.timestamp().saturating_sub(resumed.timestamp()) >= REENTRY_OBSERVATION_SECS;
+    Some((stabilization, focused_seconds, switches, finalized))
+}
+
+fn refresh_reentry_episodes(state: &mut TrackingState, now: chrono::DateTime<chrono::Local>) {
+    for index in 0..state.reentry_episodes.len() {
+        if state.reentry_episodes[index].finalized { continue; }
+        let episode = state.reentry_episodes[index].clone();
+        if let Some((stabilization, focused_seconds, switches, finalized)) = reentry_outcome(&state.flow_minutes, &episode, now) {
+            let current = &mut state.reentry_episodes[index];
+            current.stabilization_seconds = stabilization;
+            current.focused_seconds_first_10m = focused_seconds;
+            current.switch_count_first_10m = switches;
+            current.finalized = finalized;
+        }
+    }
+}
+
+fn begin_pending_reentry(state: &mut TrackingState, now: chrono::DateTime<chrono::Local>) {
+    if state.report_settings.enabled { state.pending_reentry = Some(PendingReentry { break_started_at: now.to_rfc3339() }); }
+}
+
+fn begin_reentry_episode(state: &mut TrackingState, now: chrono::DateTime<chrono::Local>) {
+    if !state.report_settings.enabled { return; }
+    let pending = match state.pending_reentry.take() { Some(value) => value, None => return };
+    let break_start = match parse_local_timestamp(&pending.break_started_at) { Some(value) => value, None => return };
+    let break_seconds = now.timestamp().saturating_sub(break_start.timestamp());
+    if !(REENTRY_MIN_BREAK_SECS..=REENTRY_MAX_BREAK_SECS).contains(&break_seconds) { return; }
+    state.reentry_episodes.push(ReentryEpisode {
+        id: format!("{}-{}", pending.break_started_at, now.timestamp()),
+        break_started_at: pending.break_started_at,
+        resumed_at: now.to_rfc3339(),
+        break_seconds: break_seconds as u64,
+        stabilization_seconds: None,
+        focused_seconds_first_10m: 0,
+        switch_count_first_10m: 0,
+        finalized: false,
+    });
+    if state.reentry_episodes.len() > MAX_REENTRY_EPISODES { state.reentry_episodes.remove(0); }
+}
+
+fn aggregate_reentry_metrics(state: &TrackingState, date: &str) -> ReentryMetrics {
+    let episodes: Vec<&ReentryEpisode> = state.reentry_episodes.iter().filter(|episode| report_date_matches(&episode.resumed_at, date) && episode.finalized).collect();
+    if episodes.is_empty() { return ReentryMetrics::default(); }
+    let breaks = episodes.iter().map(|episode| episode.break_seconds as f64).collect();
+    let stabilizations: Vec<f64> = episodes.iter().filter_map(|episode| episode.stabilization_seconds.map(|value| value as f64)).collect();
+    let missing = episodes.iter().filter(|episode| episode.stabilization_seconds.is_none()).count();
+    let switches = episodes.iter().map(|episode| episode.switch_count_first_10m as u64).sum::<u64>();
+    ReentryMetrics {
+        analyzable_episode_count: episodes.len().min(u16::MAX as usize) as u16,
+        median_break_seconds: median_f64(breaks).map(|value| value.round().min(u32::MAX as f64) as u32),
+        median_stabilization_seconds: median_f64(stabilizations).map(|value| value.round().min(u32::MAX as f64) as u32),
+        stabilization_missing_share: Some(missing as f32 / episodes.len() as f32),
+        post_resume_switches_per_episode: Some(switches as f32 / episodes.len() as f32),
+    }
+}
+
+struct BaselineSelection<'a> {
+    descriptor: BaselineDescriptor,
+    records: Vec<&'a DailyReportRecord>,
+}
+
+fn parsed_date(value: &str) -> Option<chrono::NaiveDate> { chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok() }
+
+fn make_baseline_selection<'a>(cohort: &str, records: Vec<&'a DailyReportRecord>) -> BaselineSelection<'a> {
+    let mut dates: Vec<String> = records.iter().map(|record| record.date.clone()).collect();
+    dates.sort();
+    BaselineSelection {
+        descriptor: BaselineDescriptor {
+            cohort: cohort.into(), sample_count: records.len().min(u16::MAX as usize) as u16,
+            date_range_start: dates.first().cloned(), date_range_end: dates.last().cloned(),
+        },
+        records,
+    }
+}
+
+fn select_baseline<'a>(reports: &'a [DailyReportRecord], settings: &ReportSettings, date: &str) -> BaselineSelection<'a> {
+    use chrono::Datelike;
+    let today = match parsed_date(date) {
+        Some(value) => value,
+        None => return make_baseline_selection("unavailable", Vec::new()),
+    };
+    let weekday = today.weekday();
+    let candidates: Vec<&DailyReportRecord> = reports.iter().filter(|record| {
+        if record.status != "finalized" || record.data_quality.level != "sufficient" || record.date == date { return false; }
+        parsed_date(&record.date).map(|day| {
+            let age = today.signed_duration_since(day).num_days();
+            (1..=56).contains(&age)
+        }).unwrap_or(false)
+    }).collect();
+    let tagged_weekday: Vec<&DailyReportRecord> = candidates.iter().copied().filter(|record| record.context.work_mode_tag == settings.work_mode_tag && settings.work_mode_tag.is_some() && parsed_date(&record.date).map(|day| day.weekday() == weekday).unwrap_or(false)).collect();
+    if tagged_weekday.len() >= 8 { return make_baseline_selection("tag_weekday", tagged_weekday); }
+    let tagged: Vec<&DailyReportRecord> = candidates.iter().copied().filter(|record| record.context.work_mode_tag == settings.work_mode_tag && settings.work_mode_tag.is_some()).collect();
+    if tagged.len() >= 10 { return make_baseline_selection("tag", tagged); }
+    let same_weekday: Vec<&DailyReportRecord> = candidates.iter().copied().filter(|record| parsed_date(&record.date).map(|day| day.weekday() == weekday).unwrap_or(false)).collect();
+    if same_weekday.len() >= 10 { return make_baseline_selection("weekday", same_weekday); }
+    if candidates.len() >= 14 { return make_baseline_selection("all_days", candidates); }
+    make_baseline_selection("unavailable", Vec::new())
+}
+
+fn robust_comparison(current: f64, values: Vec<f64>, floor: f64) -> (Option<f64>, Option<f32>, u16) {
+    let count = values.len().min(u16::MAX as usize) as u16;
+    let median = match median_f64(values.clone()) { Some(value) => value, None => return (None, None, 0) };
+    let deviations = values.into_iter().map(|value| (value - median).abs()).collect();
+    let mad = median_f64(deviations).unwrap_or(0.0);
+    let scale = (1.4826 * mad).max(floor);
+    (Some(median), Some(((current - median) / scale) as f32), count)
+}
+
+fn metric_evidence(metric: &str, value: f64, unit: &str, baseline: Option<f64>, sample_count: u16) -> EvidenceValue {
+    EvidenceValue { metric: metric.into(), value, unit: unit.into(), baseline_median: baseline, baseline_sample_count: sample_count }
+}
+
+fn unavailable_signal(code: &str, label: &str, explanation: &str) -> FlowStrainSignal {
+    FlowStrainSignal { code: code.into(), label: label.into(), state: "not_evaluated".into(), current_value: None, baseline_median: None, robust_delta: None, evidence: Vec::new(), explanation: explanation.into() }
+}
+
+fn part<'a>(parts: &'a [DayPartMetrics], name: &str) -> Option<&'a DayPartMetrics> { parts.iter().find(|item| item.part == name) }
+
+fn day_part_baseline_values(records: &[&DailyReportRecord], name: &str) -> Vec<f64> {
+    records.iter().filter_map(|record| part(&record.day_parts, name)).filter(|item| item.observed_seconds > 0).map(|item| item.switches_per_active_hour as f64).collect()
+}
+
+fn assess_flow_strain(metrics: &DailyFlowMetrics, day_parts: &[DayPartMetrics], reentry: &ReentryMetrics, baseline: &BaselineSelection<'_>, quality: &ReportDataQuality) -> FlowStrainAssessment {
+    let eligible = quality.level == "sufficient" && !baseline.records.is_empty();
+    if !eligible {
+        return FlowStrainAssessment {
+            eligible: false, baseline: baseline.descriptor.clone(), signal_count: 0,
+            signals: vec![
+                unavailable_signal("late_fragmentation", "후반 전환 변화", "관측 품질 또는 개인 기준선 표본이 부족해 비교하지 않았습니다."),
+                unavailable_signal("reentry_friction", "재진입 흐름", "관측 품질 또는 개인 기준선 표본이 부족해 비교하지 않았습니다."),
+                unavailable_signal("extended_unbroken_flow", "긴 연속 활동", "관측 품질 또는 개인 기준선 표본이 부족해 비교하지 않았습니다."),
+                unavailable_signal("rhythm_volatility", "상호작용 리듬 변화", "관측 품질 또는 개인 기준선 표본이 부족해 비교하지 않았습니다."),
+            ],
+        };
+    }
+
+    let afternoon = part(day_parts, "afternoon");
+    let morning = part(day_parts, "morning");
+    let late_signal = if let Some(afternoon) = afternoon.filter(|item| item.observed_seconds >= 45 * 60) {
+        let (median, delta, sample) = robust_comparison(afternoon.switches_per_active_hour as f64, day_part_baseline_values(&baseline.records, "afternoon"), 1.0);
+        let morning_increase = morning.map(|item| afternoon.switches_per_active_hour > item.switches_per_active_hour * 1.30).unwrap_or(false);
+        let state = match delta {
+            Some(value) if morning_increase && value >= 1.75 => "high",
+            Some(value) if morning_increase && value >= 1.0 => "elevated",
+            _ => "within_personal_range",
+        };
+        FlowStrainSignal {
+            code: "late_fragmentation".into(), label: "후반 전환 변화".into(), state: state.into(),
+            current_value: Some(afternoon.switches_per_active_hour as f64), baseline_median: median, robust_delta: delta,
+            evidence: vec![metric_evidence("afternoon_switches_per_active_hour", afternoon.switches_per_active_hour as f64, "switches/hour", median, sample), metric_evidence("afternoon_observed_minutes", afternoon.observed_seconds as f64 / 60.0, "minutes", None, 0)],
+            explanation: if state == "within_personal_range" { "후반 앱 전환 밀도는 현재 개인 기준선 범위에서 기록되었습니다.".into() } else { "오후 전환 밀도가 개인 기준보다 높고 오전보다도 증가했습니다. 이는 작업 흐름의 변화 신호이며 능력이나 건강 상태의 판단이 아닙니다.".into() },
+        }
+    } else { unavailable_signal("late_fragmentation", "후반 전환 변화", "오후 관측 시간이 45분 미만이어서 후반 전환을 비교하지 않았습니다.") };
+
+    let reentry_signal = if reentry.analyzable_episode_count >= 2 {
+        let current = reentry.median_stabilization_seconds.map(|value| value as f64);
+        let values: Vec<f64> = baseline.records.iter().filter_map(|record| record.reentry.median_stabilization_seconds.map(|value| value as f64)).collect();
+        let (median, delta, sample) = current.map(|value| robust_comparison(value, values, 60.0)).unwrap_or((None, None, 0));
+        let missing = reentry.stabilization_missing_share.unwrap_or(0.0) >= 0.50;
+        let current_switches = reentry.post_resume_switches_per_episode.unwrap_or(0.0) as f64;
+        let (switch_median, switch_delta, _) = robust_comparison(current_switches, baseline.records.iter().filter_map(|record| record.reentry.post_resume_switches_per_episode.map(|value| value as f64)).collect(), 1.0);
+        let state = match delta {
+            Some(value) if value >= 1.75 && switch_delta.unwrap_or(0.0) > 0.0 => "high",
+            Some(value) if value >= 1.0 || missing => "elevated",
+            _ if missing => "elevated",
+            _ => "within_personal_range",
+        };
+        FlowStrainSignal {
+            code: "reentry_friction".into(), label: "재진입 흐름".into(), state: state.into(), current_value: current, baseline_median: median, robust_delta: delta,
+            evidence: vec![metric_evidence("median_stabilization_seconds", current.unwrap_or(0.0), "seconds", median, sample), metric_evidence("post_resume_switches_per_episode", current_switches, "switches/episode", switch_median, baseline.descriptor.sample_count)],
+            explanation: if state == "within_personal_range" { "분석 가능한 중단 뒤 재진입 흐름은 현재 개인 기준선 범위에서 기록되었습니다.".into() } else { "중단 뒤 연속 흐름이 형성되기까지의 시간 또는 재개 직후 전환이 평소보다 길게 기록되었습니다. 이는 작업 흐름의 관찰값입니다.".into() },
+        }
+    } else { unavailable_signal("reentry_friction", "재진입 흐름", "3~60분 중단 뒤 재개한 사례가 2개 미만이어서 비교하지 않았습니다.") };
+
+    let extended_values: Vec<f64> = baseline.records.iter().map(|record| record.metrics.long_form_focus_share as f64).collect();
+    let (extended_median, extended_delta, extended_sample) = robust_comparison(metrics.long_form_focus_share as f64, extended_values, 0.08);
+    let extended_condition = metrics.extended_session_count >= 1 && metrics.short_break_after_extended_count >= 1;
+    let extended_state = match extended_delta {
+        Some(value) if extended_condition && (metrics.extended_session_count >= 2 || value >= 1.75) => "high",
+        Some(_) if extended_condition => "elevated",
+        _ => "within_personal_range",
+    };
+    let extended_signal = FlowStrainSignal {
+        code: "extended_unbroken_flow".into(), label: "긴 연속 활동".into(), state: extended_state.into(),
+        current_value: Some(metrics.long_form_focus_share as f64), baseline_median: extended_median, robust_delta: extended_delta,
+        evidence: vec![metric_evidence("long_form_focus_share", metrics.long_form_focus_share as f64, "ratio", extended_median, extended_sample), metric_evidence("extended_session_count", metrics.extended_session_count as f64, "sessions", None, 0)],
+        explanation: if extended_state == "within_personal_range" { "긴 연속 활동의 비중은 현재 개인 기준선 범위에서 기록되었습니다.".into() } else { "90분 이상 연속 활동 뒤 짧은 중단이 반복되었습니다. 이 값은 휴식 필요성이나 건강 상태를 판단하지 않고 세션 구조만 설명합니다.".into() },
+    };
+
+    let rhythm_signal = if let Some(current_cv) = metrics.input_density_cv {
+        let (cv_median, cv_delta, cv_sample) = robust_comparison(current_cv as f64, baseline.records.iter().filter_map(|record| record.metrics.input_density_cv.map(|value| value as f64)).collect(), 0.10);
+        let (switch_median, switch_delta, _) = robust_comparison(metrics.switches_per_active_hour as f64, baseline.records.iter().map(|record| record.metrics.switches_per_active_hour as f64).collect(), 1.0);
+        let state = match (cv_delta, switch_delta) {
+            (Some(cv), Some(sw)) if cv >= 1.75 && sw >= 1.75 => "high",
+            (Some(cv), Some(sw)) if cv >= 1.0 && sw >= 1.0 => "elevated",
+            _ => "within_personal_range",
+        };
+        FlowStrainSignal {
+            code: "rhythm_volatility".into(), label: "상호작용 리듬 변화".into(), state: state.into(), current_value: Some(current_cv as f64), baseline_median: cv_median, robust_delta: cv_delta,
+            evidence: vec![metric_evidence("input_density_cv", current_cv as f64, "coefficient", cv_median, cv_sample), metric_evidence("switches_per_active_hour", metrics.switches_per_active_hour as f64, "switches/hour", switch_median, baseline.descriptor.sample_count)],
+            explanation: if state == "within_personal_range" { "입력 리듬과 전환 밀도는 현재 개인 기준선 범위에서 기록되었습니다.".into() } else { "입력 리듬의 변동과 앱 전환이 함께 증가했습니다. 입력량 자체는 작업 성과로 해석하지 않습니다.".into() },
+        }
+    } else { unavailable_signal("rhythm_volatility", "상호작용 리듬 변화", "관측된 5분 입력 버킷이 충분하지 않아 리듬 변동을 비교하지 않았습니다.") };
+
+    let signals = vec![late_signal, reentry_signal, extended_signal, rhythm_signal];
+    let signal_count = signals.iter().filter(|signal| signal.state == "elevated" || signal.state == "high").count().min(u8::MAX as usize) as u8;
+    FlowStrainAssessment { eligible: true, baseline: baseline.descriptor.clone(), signals, signal_count }
+}
+
+fn render_daily_report_content(quality: &ReportDataQuality, metrics: &DailyFlowMetrics, strain: &FlowStrainAssessment) -> DailyReportContent {
+    let headline = if quality.level == "insufficient" { "오늘의 기록을 더 모으면 흐름 요약을 만들 수 있습니다.".into() }
+        else if !strain.eligible { "오늘의 작업 흐름을 기록했습니다. 개인 기준선은 더 쌓인 뒤 비교합니다.".into() }
+        else if strain.signal_count == 0 { "오늘의 흐름은 현재 개인 기준선 범위에서 기록되었습니다.".into() }
+        else if strain.signal_count == 1 { "오늘의 흐름에서 확인할 변화 신호가 1개 있습니다.".into() }
+        else { "오늘의 후반 작업 흐름에서 여러 변화 신호가 함께 기록되었습니다.".into() };
+    let highlights: Vec<ReportInsight> = strain.signals.iter().filter(|signal| signal.state == "elevated" || signal.state == "high").map(|signal| ReportInsight {
+        code: signal.code.clone(), level: "notice".into(), title: signal.label.clone(), detail: signal.explanation.clone(), evidence: signal.evidence.clone(),
+    }).collect();
+    let observations = vec![ReportInsight {
+        code: "daily_flow_summary".into(), level: "neutral".into(), title: "오늘의 흐름 요약".into(),
+        detail: format!("집중 {:.0}분, 세션 {}개, 활성 1시간당 전환 {:.1}회가 로컬 집계되었습니다.", metrics.focus_seconds as f64 / 60.0, metrics.session_count, metrics.switches_per_active_hour),
+        evidence: vec![metric_evidence("focus_minutes", metrics.focus_seconds as f64 / 60.0, "minutes", None, 0), metric_evidence("session_count", metrics.session_count as f64, "sessions", None, 0)],
+    }];
+    DailyReportContent { headline, highlights, observations, limitations: quality.limitations.clone() }
+}
+
+fn build_daily_report(state: &TrackingState, date: &str, status: &str, now: chrono::DateTime<chrono::Local>) -> DailyReportRecord {
+    let mut quality = assess_report_data_quality(state, date);
+    let metrics = aggregate_daily_flow_metrics(state, date);
+    let day_parts = aggregate_day_parts(state, date);
+    let reentry = aggregate_reentry_metrics(state, date);
+    let baseline = select_baseline(&state.daily_reports, &state.report_settings, date);
+    quality.comparison_sample_count = baseline.descriptor.sample_count;
+    let strain = assess_flow_strain(&metrics, &day_parts, &reentry, &baseline, &quality);
+    let report = render_daily_report_content(&quality, &metrics, &strain);
+    DailyReportRecord {
+        schema_version: 1, date: date.into(), generated_at: now.to_rfc3339(), status: status.into(),
+        data_quality: quality, context: current_daily_context(state), metrics, day_parts, reentry, strain, report,
+    }
+}
+
+fn upsert_daily_report(state: &mut TrackingState, report: DailyReportRecord) {
+    if let Some(index) = state.daily_reports.iter().position(|item| item.date == report.date) { state.daily_reports[index] = report; }
+    else { state.daily_reports.push(report); }
+    state.daily_reports.sort_by(|left, right| left.date.cmp(&right.date));
+    while state.daily_reports.len() > MAX_DAILY_REPORTS {
+        if let Some(index) = state.daily_reports.iter().position(|item| item.status == "finalized") { state.daily_reports.remove(index); }
+        else { state.daily_reports.remove(0); }
+    }
+}
+
+fn allowed_work_mode_tag(tag: &str) -> bool { matches!(tag, "구현" | "디버깅" | "문서화" | "검토" | "회의" | "학습" | "운영 대응") }
+
 fn record_event(state: &mut TrackingState, at: String, app: String, title: String, kind: &str) {
     state.timeline.push(TimelineEvent { at, app, title, kind: kind.into() });
     if state.timeline.len() > MAX_TIMELINE { state.timeline.remove(0); }
@@ -627,6 +1300,8 @@ fn reset_daily_activity(state: &mut TrackingState) {
     state.current_session_started_at = None; state.current_session_active_seconds = 0; state.current_session_idle_seconds = 0;
     state.current_session_switches = 0; state.current_session_apps.clear(); state.last_input_at = None; state.last_input_age_seconds = 0;
     state.resume_latency_seconds = 0; state.daily_feature = DailyFeatureVector { schema_version: 2, local_only: true, ..Default::default() };
+    state.reentry_episodes.clear(); state.pending_reentry = None;
+    state.report_settings.work_mode_tag = None; state.report_settings.flow_satisfaction = None;
 }
 
 fn rollover_if_needed(state: &mut TrackingState, now: chrono::DateTime<chrono::Local>) {
@@ -636,8 +1311,15 @@ fn rollover_if_needed(state: &mut TrackingState, now: chrono::DateTime<chrono::L
     }
     if state.collection_day != today {
         let previous_day = state.collection_day.clone();
+        if state.current_session_started_at.is_some() { close_current_session(state, now.to_rfc3339(), "day_rollover"); }
+        state.pending_reentry = None;
+        refresh_reentry_episodes(state, now);
         update_daily_feature(state, now);
-        state.daily_feature.date = previous_day;
+        state.daily_feature.date = previous_day.clone();
+        if state.report_settings.enabled {
+            let report = build_daily_report(state, &previous_day, "finalized", now);
+            upsert_daily_report(state, report);
+        }
         upsert_current_embedding(state, now);
         reset_daily_activity(state);
         state.collection_day = today.clone();
@@ -695,6 +1377,7 @@ fn set_tracking(enabled: bool, state: tauri::State<'_, SharedState>, path: tauri
         let app = current.active_window.clone();
         record_event(&mut current, now.to_rfc3339(), app.clone(), app, "session_end_paused");
         close_current_session(&mut current, now.to_rfc3339(), "tracking_paused");
+        current.pending_reentry = None;
     }
     current.enabled = enabled;
     save(&current, &storage_path(&path)?)?;
@@ -711,6 +1394,79 @@ fn get_focus_experience_view(date: String, bucket_minutes: u8, state: tauri::Sta
     if selected_date != current.collection_day { return Err("P0 focus experience currently supports the locally collected current day only".into()); }
     Ok(build_focus_experience_view(&current, &selected_date, bucket_minutes))
 }
+#[tauri::command]
+fn get_daily_report(date: String, include_draft: bool, state: tauri::State<'_, SharedState>) -> Result<DailyReportRecord, String> {
+    let mut current = state.lock().map_err(|_| "state unavailable")?;
+    if !current.report_settings.enabled { return Err("daily reports are disabled; enable local daily reports before requesting an archive".into()); }
+    let selected_date = if date.is_empty() { current.collection_day.clone() } else { date };
+    if selected_date == current.collection_day {
+        if !include_draft { return Err("the current local daily report is a draft; request include_draft to view it".into()); }
+        let now = chrono::Local::now();
+        refresh_reentry_episodes(&mut current, now);
+        return Ok(build_daily_report(&current, &selected_date, "draft", now));
+    }
+    current.daily_reports.iter().find(|report| report.date == selected_date && (include_draft || report.status == "finalized")).cloned().ok_or_else(|| "daily report not found in the local archive".into())
+}
+
+#[tauri::command]
+fn get_daily_report_history(limit: u16, state: tauri::State<'_, SharedState>) -> Result<Vec<DailyReportListItem>, String> {
+    let current = state.lock().map_err(|_| "state unavailable")?;
+    let cap = if limit == 0 { 30 } else { limit.min(365) } as usize;
+    Ok(current.daily_reports.iter().rev().take(cap).map(|report| DailyReportListItem {
+        date: report.date.clone(), status: report.status.clone(), headline: report.report.headline.clone(),
+        data_quality_level: report.data_quality.level.clone(), signal_count: report.strain.signal_count,
+        work_mode_tag: report.context.work_mode_tag.clone(),
+    }).collect())
+}
+
+#[tauri::command]
+fn set_daily_report_enabled(enabled: bool, state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<ReportSettings, String> {
+    let mut current = state.lock().map_err(|_| "state unavailable")?;
+    current.report_settings.enabled = enabled;
+    if !enabled { current.pending_reentry = None; }
+    save(&current, &storage_path(&path)?)?;
+    Ok(current.report_settings.clone())
+}
+
+#[tauri::command]
+fn set_daily_work_mode_tag(tag: Option<String>, state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<DailyContext, String> {
+    if let Some(value) = tag.as_deref() { if !allowed_work_mode_tag(value) { return Err("unsupported work mode tag".into()); } }
+    let mut current = state.lock().map_err(|_| "state unavailable")?;
+    current.report_settings.work_mode_tag = tag;
+    let context = current_daily_context(&current);
+    save(&current, &storage_path(&path)?)?;
+    Ok(context)
+}
+
+#[tauri::command]
+fn set_flow_reflection(value: Option<u8>, state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<DailyContext, String> {
+    if let Some(score) = value { if !(1..=5).contains(&score) { return Err("flow reflection must be an integer from 1 to 5".into()); } }
+    let mut current = state.lock().map_err(|_| "state unavailable")?;
+    if !current.report_settings.reflection_enabled && value.is_some() { return Err("flow reflection is disabled in local report settings".into()); }
+    current.report_settings.flow_satisfaction = value;
+    let context = current_daily_context(&current);
+    save(&current, &storage_path(&path)?)?;
+    Ok(context)
+}
+
+#[tauri::command]
+fn set_flow_reflection_enabled(enabled: bool, state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<ReportSettings, String> {
+    let mut current = state.lock().map_err(|_| "state unavailable")?;
+    current.report_settings.reflection_enabled = enabled;
+    if !enabled { current.report_settings.flow_satisfaction = None; }
+    save(&current, &storage_path(&path)?)?;
+    Ok(current.report_settings.clone())
+}
+
+#[tauri::command]
+fn clear_daily_report_history(state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<(), String> {
+    let mut current = state.lock().map_err(|_| "state unavailable")?;
+    current.daily_reports.clear(); current.reentry_episodes.clear(); current.pending_reentry = None;
+    current.report_settings.work_mode_tag = None; current.report_settings.flow_satisfaction = None;
+    save(&current, &storage_path(&path)?)?;
+    Ok(())
+}
+
 #[tauri::command]
 fn get_daily_feature_vector(state: tauri::State<'_, SharedState>) -> Result<DailyFeatureVector, String> { state.lock().map(|value| value.daily_feature.clone()).map_err(|_| "state unavailable".into()) }
 #[tauri::command]
@@ -945,12 +1701,15 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                     if !idle && current.current_session_started_at.is_none() {
                         current.resume_latency_seconds = current.last_input_age_seconds;
                         current.current_session_started_at = Some(now.to_rfc3339());
+                        begin_reentry_episode(&mut current, now);
                         record_event(&mut current, now.to_rfc3339(), active_app.clone(), active_app.clone(), "session_start");
                     }
                     if idle && current.current_session_started_at.is_some() {
                         record_event(&mut current, now.to_rfc3339(), active_app.clone(), active_app.clone(), "session_end_idle");
                         close_current_session(&mut current, now.to_rfc3339(), "idle");
+                        begin_pending_reentry(&mut current, now);
                     }
+                    refresh_reentry_episodes(&mut current, now);
                     update_daily_feature(&mut current, now);
                 }
                 last_second = Instant::now();
@@ -969,8 +1728,14 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                     let snapshot = MinuteSnapshot { at: now.to_rfc3339(), active_app_count: current.active_app_count, focus_seconds: current.focus_seconds, keyboard_actions: current.keyboard_actions, mouse_actions: current.mouse_actions, mouse_distance_px: current.mouse_distance_px, network_rx_bytes: current.network_rx_bytes, network_tx_bytes: current.network_tx_bytes, idle_seconds: current.idle_seconds, context_switches: current.context_switches };
                     current.minute_snapshots.push(snapshot);
                     if current.minute_snapshots.len() > MAX_MINUTE_SNAPSHOTS { current.minute_snapshots.remove(0); }
+                    refresh_reentry_episodes(&mut current, now);
                     update_daily_feature(&mut current, now);
                     upsert_current_embedding(&mut current, now);
+                    if current.report_settings.enabled && now.minute() % FOCUS_BUCKET_MINUTES as u32 == 0 {
+                        let date = current.collection_day.clone();
+                        let report = build_daily_report(&current, &date, "draft", now);
+                        upsert_daily_report(&mut current, report);
+                    }
                 }
                 if process_cache.len() > 512 { process_cache.clear(); }
                 last_minute = now.minute();
@@ -993,7 +1758,7 @@ pub fn run() {
         if let Ok(mut current) = setup_state.lock() { *current = load(&file); let now = chrono::Local::now(); rollover_if_needed(&mut current, now); if current.collection_day.is_empty() { current.collection_day = now.date_naive().to_string(); current.daily_feature.date = current.collection_day.clone(); } }
         if let Ok(mut current_path) = setup_path.lock() { *current_path = file; }
         start_tracker(setup_state.clone(), setup_path.clone()); Ok(())
-    }).manage(state).manage(path).invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, request_notification_access, request_per_app_network_collection]).run(tauri::generate_context!()).expect("error while running FlowLens");
+    }).manage(state).manage(path).invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_report, get_daily_report_history, set_daily_report_enabled, set_daily_work_mode_tag, set_flow_reflection, set_flow_reflection_enabled, clear_daily_report_history, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, request_notification_access, request_per_app_network_collection]).run(tauri::generate_context!()).expect("error while running FlowLens");
 }
 
 
@@ -1050,5 +1815,96 @@ mod focus_experience_tests {
         assert!(view.sessions.sessions[0].is_live);
         assert_eq!(view.sessions.sessions[0].status, "steady");
         assert_eq!(view.sessions.summary.completed_count, 1);
+    }
+}
+
+
+#[cfg(test)]
+mod daily_report_tests {
+    use super::*;
+
+    fn report_minute(at: &str, focus: u16, idle: u16, switches: u16, input: u32) -> FlowMinute {
+        FlowMinute { start_at: at.into(), observed_seconds: focus.saturating_add(idle), focus_seconds: focus, idle_seconds: idle, switch_count: switches, keyboard_actions: input, mouse_actions: 0, mouse_distance_px: 0.0 }
+    }
+
+    fn add_sufficient_flow(state: &mut TrackingState, date: &str, hour: u32, switches: u16, input: u32) {
+        for minute in 0..120u32 {
+            let total = hour * 60 + minute;
+            let hour_value = total / 60;
+            let minute_value = total % 60;
+            state.flow_minutes.push(report_minute(&format!("{date}T{hour_value:02}:{minute_value:02}:00+09:00"), 60, 0, switches, input));
+        }
+        state.sessions.push(WorkSession { started_at: format!("{date}T{hour:02}:00:00+09:00"), ended_at: Some(format!("{date}T{:02}:00:00+09:00", hour + 1)), active_seconds: 3_600, idle_seconds: 0, switch_count: switches as u64 * 60, app_count: 2, end_reason: Some("idle".into()) });
+        state.sessions.push(WorkSession { started_at: format!("{date}T{:02}:00:00+09:00", hour + 1), ended_at: Some(format!("{date}T{:02}:00:00+09:00", hour + 2)), active_seconds: 3_600, idle_seconds: 0, switch_count: switches as u64 * 60, app_count: 2, end_reason: Some("idle".into()) });
+    }
+
+    fn baseline_record(date: &str, tag: Option<&str>, afternoon_switches: f32, input_cv: f32, long_share: f32) -> DailyReportRecord {
+        DailyReportRecord {
+            schema_version: 1, date: date.into(), generated_at: format!("{date}T23:59:00+09:00"), status: "finalized".into(),
+            data_quality: ReportDataQuality { level: "sufficient".into(), ..Default::default() },
+            context: DailyContext { work_mode_tag: tag.map(str::to_string), ..Default::default() },
+            metrics: DailyFlowMetrics { switches_per_active_hour: 4.0, input_density_cv: Some(input_cv), long_form_focus_share: long_share, ..Default::default() },
+            day_parts: vec![DayPartMetrics { part: "morning".into(), observed_seconds: 3600, switches_per_active_hour: 3.0, ..Default::default() }, DayPartMetrics { part: "midday".into(), ..Default::default() }, DayPartMetrics { part: "afternoon".into(), observed_seconds: 3600, switches_per_active_hour: afternoon_switches, ..Default::default() }, DayPartMetrics { part: "evening".into(), ..Default::default() }],
+            reentry: ReentryMetrics { analyzable_episode_count: 2, median_stabilization_seconds: Some(300), post_resume_switches_per_episode: Some(1.0), stabilization_missing_share: Some(0.0), ..Default::default() },
+            strain: FlowStrainAssessment::default(), report: DailyReportContent::default(),
+        }
+    }
+
+    #[test]
+    fn finalizes_and_retains_at_most_365_local_reports() {
+        let mut state = TrackingState::default();
+        let start = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        for offset in 0..=365i64 {
+            let date = (start + chrono::Duration::days(offset)).to_string();
+            upsert_daily_report(&mut state, DailyReportRecord { date, status: "finalized".into(), ..Default::default() });
+        }
+        assert_eq!(state.daily_reports.len(), MAX_DAILY_REPORTS);
+        assert_eq!(state.daily_reports.first().unwrap().date, "2025-01-02");
+    }
+
+    #[test]
+    fn selects_tag_and_weekday_baseline_before_broader_cohorts() {
+        let mut state = TrackingState::default();
+        state.report_settings.work_mode_tag = Some("구현".into());
+        for day in ["2026-01-05", "2026-01-12", "2026-01-19", "2026-01-26", "2026-02-02", "2026-02-09", "2026-02-16", "2026-02-23"] {
+            state.daily_reports.push(baseline_record(day, Some("구현"), 4.0, 0.2, 0.4));
+        }
+        let baseline = select_baseline(&state.daily_reports, &state.report_settings, "2026-03-02");
+        assert_eq!(baseline.descriptor.cohort, "tag_weekday");
+        assert_eq!(baseline.descriptor.sample_count, 8);
+    }
+
+    #[test]
+    fn identifies_late_fragmentation_without_creating_a_health_score() {
+        let mut state = TrackingState::default();
+        state.report_settings.enabled = true;
+        state.report_settings.work_mode_tag = Some("구현".into());
+        state.collection_day = "2026-03-02".into();
+        for week in 1..=14u32 {
+            state.daily_reports.push(baseline_record(&format!("2026-02-{week:02}"), Some("구현"), 2.0, 0.2, 0.4));
+        }
+        add_sufficient_flow(&mut state, "2026-03-02", 9, 0, 8);
+        add_sufficient_flow(&mut state, "2026-03-02", 11, 0, 8);
+        add_sufficient_flow(&mut state, "2026-03-02", 14, 8, 40);
+        let report = build_daily_report(&state, "2026-03-02", "draft", chrono::Local::now());
+        let signal = report.strain.signals.iter().find(|item| item.code == "late_fragmentation").unwrap();
+        assert!(matches!(signal.state.as_str(), "elevated" | "high"));
+        assert!(report.report.headline.contains("변화 신호"));
+    }
+
+    #[test]
+    fn excludes_short_and_long_breaks_from_reentry_analysis() {
+        let mut state = TrackingState::default();
+        state.report_settings.enabled = true;
+        let now = chrono::Local::now();
+        state.pending_reentry = Some(PendingReentry { break_started_at: (now - chrono::Duration::seconds(120)).to_rfc3339() });
+        begin_reentry_episode(&mut state, now);
+        assert!(state.reentry_episodes.is_empty());
+        state.pending_reentry = Some(PendingReentry { break_started_at: (now - chrono::Duration::seconds(600)).to_rfc3339() });
+        begin_reentry_episode(&mut state, now);
+        assert_eq!(state.reentry_episodes.len(), 1);
+        state.pending_reentry = Some(PendingReentry { break_started_at: (now - chrono::Duration::seconds(4_000)).to_rfc3339() });
+        begin_reentry_episode(&mut state, now);
+        assert_eq!(state.reentry_episodes.len(), 1);
     }
 }
