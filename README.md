@@ -9,6 +9,8 @@ Windows용 Tauri 기반 개인 생산성 분석 앱입니다. 사용자의 작�
 - 창 너비에 적응하는 반응형 UI: 넓은 창에서는 다열 대시보드, 980px 이하에서는 토글형 탐색 패널과 재배치 카드, 680px 이하에서는 단일 열·스크롤 가능 설정 시트로 전환
 - 24개 시간 막대의 너비가 동일한 집중·유휴 흐름 그래프와 설명 가능한 패턴 분석 카드
 - 가장 많이 사용한 앱의 활성 시간 분포(브라우저 URL은 수집하지 않음)
+- 앱별 활성 시간을 일별로 최대 365일 보관하고, 현재일을 포함한 최근 7일·30일의 사용 시간과 직전 동일 기간 변화를 반응형 누적 막대 차트로 표시
+- 장기 앱 사용 이력에는 실행 파일명·활성 시간·활성화 횟수만 저장하며, 창 제목·문서 이름·URL·입력 내용은 저장하지 않고 설정에서 이력만 별도 삭제 가능
 - 추적 일시정지/재개 UI 및 설정 페이지의 수집 데이터 전체 삭제
 - Tauri Rust command: `set_tracking`, `get_tracking_state`, `get_embedding_analysis`, `set_embedding_enabled`, `clear_embedding_data`, `clear_all_data`
 - Windows 활성 창 제목을 수집하는 Windows API 연동 (`GetForegroundWindow`, `GetWindowTextW`)
@@ -30,6 +32,7 @@ Windows용 Tauri 기반 개인 생산성 분석 앱입니다. 사용자의 작�
 - 실제 업무일의 집중·세션·전환·개인 기준선 차이를 바탕으로 2~3줄의 비의료적 로컬 업무 평가 생성
 - 임베딩 알고리즘·보관·삭제 범위: `LOCAL_EMBEDDING.md`
 - 제목 없는 창·제목 변경·짧은 활성화 누락을 줄이는 앱 식별 방식과 검증 절차: `TRACKING_RELIABILITY.md`
+- 앱별 주간·월간 사용 시간 아카이브·집계·삭제 범위: `APP_USAGE_TRENDS.md`
 
 ## 개인정보 보호 원칙
 

@@ -15,6 +15,9 @@ const MAX_MINUTE_SNAPSHOTS: usize = 43_200;
 const MAX_FLOW_MINUTES: usize = 1_440;
 const MAX_SESSIONS: usize = 500;
 const MAX_DAILY_REPORTS: usize = 365;
+const MAX_DAILY_APP_USAGE_RECORDS: usize = 365;
+const MAX_APPS_PER_DAILY_USAGE_RECORD: usize = 48;
+const MAX_APP_USAGE_TREND_SERIES: usize = 5;
 const MAX_REENTRY_EPISODES: usize = 64;
 const FOCUS_BUCKET_MINUTES: u8 = 5;
 const REENTRY_MIN_BREAK_SECS: i64 = 3 * 60;
@@ -29,6 +32,54 @@ const MAX_DISK_SNAPSHOTS: usize = 51_840;
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct AppActivity { app: String, title: String, seconds: u64, active_millis: u64, activations: u64 }
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DailyAppUsageEntry {
+    app: String,
+    active_millis: u64,
+    activations: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DailyAppUsageRecord {
+    schema_version: u32,
+    date: String,
+    apps: Vec<DailyAppUsageEntry>,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct AppUsageTrendDay {
+    date: String,
+    total_active_millis: u64,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct AppUsageTrendSeries {
+    app: String,
+    is_other: bool,
+    total_active_millis: u64,
+    previous_total_active_millis: u64,
+    delta_active_millis: i64,
+    points: Vec<u64>,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct AppUsageTrendView {
+    schema_version: u32,
+    period: String,
+    start_date: String,
+    end_date: String,
+    tracked_days: u16,
+    previous_tracked_days: u16,
+    archive_days: u16,
+    total_active_millis: u64,
+    previous_total_active_millis: u64,
+    days: Vec<AppUsageTrendDay>,
+    apps: Vec<AppUsageTrendSeries>,
+    notice: String,
+}
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -431,6 +482,7 @@ struct TrackingState {
     focus_seconds: u64,
     hourly_focus: [u64; 24],
     apps: Vec<AppActivity>,
+    daily_app_usage: Vec<DailyAppUsageRecord>,
     timeline: Vec<TimelineEvent>,
     minute_snapshots: Vec<MinuteSnapshot>,
     flow_minutes: Vec<FlowMinute>,
@@ -474,7 +526,7 @@ impl Default for TrackingState {
     fn default() -> Self {
         Self {
             enabled: true, active_window: String::new(), keyboard_actions: 0, mouse_actions: 0,
-            app_activation_count: 0, focus_seconds: 0, hourly_focus: [0; 24], apps: Vec::new(),
+            app_activation_count: 0, focus_seconds: 0, hourly_focus: [0; 24], apps: Vec::new(), daily_app_usage: Vec::new(),
             timeline: Vec::new(), minute_snapshots: Vec::new(), flow_minutes: Vec::new(), active_app_count: 0,
             mouse_distance_px: 0.0, mouse_clicks: 0, mouse_wheel_notches: 0, disk_snapshots: Vec::new(), avg_click_interval_ms: 0,
             click_interval_count: 0, click_interval_mean_ms: 0.0, click_interval_m2: 0.0,
@@ -507,6 +559,18 @@ fn load(path: &PathBuf) -> TrackingState { fs::read(path).ok().and_then(|bytes| 
 
 fn migrate_local_state(state: &mut TrackingState) {
     state.daily_feature.schema_version = state.daily_feature.schema_version.max(3);
+    for record in &mut state.daily_app_usage {
+        record.schema_version = record.schema_version.max(1);
+        record.apps.retain(|item| !item.app.trim().is_empty() && item.active_millis > 0);
+        record.apps.sort_by(|left, right| right.active_millis.cmp(&left.active_millis).then_with(|| left.app.cmp(&right.app)));
+        record.apps.truncate(MAX_APPS_PER_DAILY_USAGE_RECORD);
+    }
+    state.daily_app_usage.sort_by(|left, right| left.date.cmp(&right.date));
+    state.daily_app_usage.dedup_by(|left, right| left.date == right.date);
+    if state.daily_app_usage.len() > MAX_DAILY_APP_USAGE_RECORDS {
+        let overflow = state.daily_app_usage.len() - MAX_DAILY_APP_USAGE_RECORDS;
+        state.daily_app_usage.drain(0..overflow);
+    }
     for record in &mut state.embedding_history {
         record.embedding.resize(EMBEDDING_DIMENSIONS, 0.0);
         record.embedding.truncate(EMBEDDING_DIMENSIONS);
@@ -535,6 +599,121 @@ fn record_app_focus(state: &mut TrackingState, app_name: &str, title: &str, elap
     if activated { item.activations = item.activations.saturating_add(1); }
     item.active_millis = item.active_millis.saturating_add(elapsed_ms);
     item.seconds = item.active_millis / 1000;
+}
+
+fn daily_usage_entries_from_apps(apps: &[AppActivity]) -> Vec<DailyAppUsageEntry> {
+    let mut totals: HashMap<String, (u64, u64)> = HashMap::new();
+    for item in apps {
+        let app = item.app.trim();
+        let active_millis = item.active_millis.max(item.seconds.saturating_mul(1_000));
+        if app.is_empty() || active_millis == 0 { continue; }
+        let entry = totals.entry(app.to_string()).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(active_millis);
+        entry.1 = entry.1.saturating_add(item.activations);
+    }
+    let mut entries: Vec<DailyAppUsageEntry> = totals.into_iter()
+        .map(|(app, (active_millis, activations))| DailyAppUsageEntry { app, active_millis, activations })
+        .collect();
+    entries.sort_by(|left, right| right.active_millis.cmp(&left.active_millis).then_with(|| left.app.cmp(&right.app)));
+    entries.truncate(MAX_APPS_PER_DAILY_USAGE_RECORD);
+    entries
+}
+
+fn archive_current_day_app_usage(state: &mut TrackingState, date: &str) {
+    if date.is_empty() { return; }
+    let record = DailyAppUsageRecord { schema_version: 1, date: date.to_string(), apps: daily_usage_entries_from_apps(&state.apps) };
+    if let Some(existing) = state.daily_app_usage.iter_mut().find(|item| item.date == date) { *existing = record; }
+    else { state.daily_app_usage.push(record); state.daily_app_usage.sort_by(|left, right| left.date.cmp(&right.date)); }
+    if state.daily_app_usage.len() > MAX_DAILY_APP_USAGE_RECORDS {
+        let overflow = state.daily_app_usage.len() - MAX_DAILY_APP_USAGE_RECORDS;
+        state.daily_app_usage.drain(0..overflow);
+    }
+}
+
+fn date_range_ending_on(end_date: &str, count: usize) -> Vec<String> {
+    let end = chrono::NaiveDate::parse_from_str(end_date, "%Y-%m-%d").unwrap_or_else(|_| chrono::Local::now().date_naive());
+    let span = count.saturating_sub(1) as i64;
+    (0..count).map(|offset| (end - chrono::Duration::days(span - offset as i64)).to_string()).collect()
+}
+
+fn app_usage_map_for_date(state: &TrackingState, date: &str) -> HashMap<String, u64> {
+    let entries: Vec<DailyAppUsageEntry> = if date == state.collection_day {
+        daily_usage_entries_from_apps(&state.apps)
+    } else {
+        state.daily_app_usage.iter().find(|record| record.date == date).map(|record| record.apps.clone()).unwrap_or_default()
+    };
+    let mut totals = HashMap::new();
+    for entry in entries {
+        if entry.app.is_empty() || entry.active_millis == 0 { continue; }
+        let total = totals.entry(entry.app).or_insert(0u64);
+        *total = total.saturating_add(entry.active_millis);
+    }
+    totals
+}
+
+fn app_usage_total(map: &HashMap<String, u64>) -> u64 { map.values().copied().sum() }
+
+fn build_app_usage_trend(state: &TrackingState, period: &str) -> Result<AppUsageTrendView, String> {
+    let (period_name, day_count) = match period {
+        "week" => ("week", 7usize),
+        "month" => ("month", 30usize),
+        _ => return Err("period must be week or month".into()),
+    };
+    let end_date = if state.collection_day.is_empty() { chrono::Local::now().date_naive().to_string() } else { state.collection_day.clone() };
+    let dates = date_range_ending_on(&end_date, day_count);
+    let previous_end = chrono::NaiveDate::parse_from_str(&dates[0], "%Y-%m-%d").unwrap_or_else(|_| chrono::Local::now().date_naive()) - chrono::Duration::days(1);
+    let previous_dates = date_range_ending_on(&previous_end.to_string(), day_count);
+    let daily_maps: Vec<HashMap<String, u64>> = dates.iter().map(|date| app_usage_map_for_date(state, date)).collect();
+    let previous_maps: Vec<HashMap<String, u64>> = previous_dates.iter().map(|date| app_usage_map_for_date(state, date)).collect();
+    let mut totals: HashMap<String, u64> = HashMap::new();
+    for map in &daily_maps {
+        for (app, active_millis) in map {
+            let total = totals.entry(app.clone()).or_insert(0);
+            *total = total.saturating_add(*active_millis);
+        }
+    }
+    let mut ranked: Vec<(String, u64)> = totals.into_iter().collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let top_apps: Vec<String> = ranked.iter().take(MAX_APP_USAGE_TREND_SERIES).map(|(app, _)| app.clone()).collect();
+    let has_other = ranked.len() > top_apps.len();
+    let mut series = Vec::new();
+    for app in &top_apps {
+        let points: Vec<u64> = daily_maps.iter().map(|map| map.get(app).copied().unwrap_or(0)).collect();
+        let total_active_millis = points.iter().copied().sum::<u64>();
+        let previous_total_active_millis = previous_maps.iter().map(|map| map.get(app).copied().unwrap_or(0)).sum::<u64>();
+        series.push(AppUsageTrendSeries {
+            app: app.clone(), is_other: false, total_active_millis, previous_total_active_millis,
+            delta_active_millis: total_active_millis as i64 - previous_total_active_millis as i64, points,
+        });
+    }
+    if has_other {
+        let points: Vec<u64> = daily_maps.iter().map(|map| map.iter().filter_map(|(app, value)| if top_apps.iter().any(|top| top == app) { None } else { Some(*value) }).sum()).collect();
+        let total_active_millis = points.iter().copied().sum::<u64>();
+        let previous_total_active_millis = previous_maps.iter().map(|map| map.iter().filter_map(|(app, value)| if top_apps.iter().any(|top| top == app) { None } else { Some(*value) }).sum::<u64>()).sum::<u64>();
+        series.push(AppUsageTrendSeries {
+            app: "기타 앱".into(), is_other: true, total_active_millis, previous_total_active_millis,
+            delta_active_millis: total_active_millis as i64 - previous_total_active_millis as i64, points,
+        });
+    }
+    let total_active_millis = daily_maps.iter().map(app_usage_total).sum::<u64>();
+    let previous_total_active_millis = previous_maps.iter().map(app_usage_total).sum::<u64>();
+    let tracked_days = daily_maps.iter().filter(|map| !map.is_empty()).count().min(u16::MAX as usize) as u16;
+    let previous_tracked_days = previous_maps.iter().filter(|map| !map.is_empty()).count().min(u16::MAX as usize) as u16;
+    let days = dates.iter().zip(daily_maps.iter()).map(|(date, map)| AppUsageTrendDay { date: date.clone(), total_active_millis: app_usage_total(map) }).collect();
+    let notice = if tracked_days == 0 {
+        "앱을 사용하면 오늘의 활성 시간부터 로컬 추이가 만들어집니다. 과거 일자는 이 기능을 설치한 뒤 자정 전환 시부터 축적됩니다.".into()
+    } else if tracked_days < day_count as u16 {
+        format!("최근 {day_count}일 중 {tracked_days}일의 로컬 기록을 표시합니다. 누락된 날짜는 앱이 실행되지 않았거나 이력 기능이 활성화되기 전입니다.")
+    } else if previous_tracked_days == 0 {
+        "현재 기간의 앱별 사용 시간입니다. 같은 길이의 이전 기간 기록이 쌓이면 변화량도 비교합니다.".into()
+    } else {
+        "현재 기간과 직전 동일 기간의 앱별 활성 시간을 비교합니다. 창 제목·문서 이름·URL은 장기 이력에 저장하지 않습니다.".into()
+    };
+    Ok(AppUsageTrendView {
+        schema_version: 1, period: period_name.into(), start_date: dates.first().cloned().unwrap_or_default(), end_date,
+        tracked_days, previous_tracked_days, archive_days: state.daily_app_usage.len().min(u16::MAX as usize) as u16,
+        total_active_millis, previous_total_active_millis, days, apps: series, notice,
+    })
 }
 
 fn flow_minute_key(now: chrono::DateTime<chrono::Local>) -> String {
@@ -1421,6 +1600,7 @@ fn rollover_if_needed(state: &mut TrackingState, now: chrono::DateTime<chrono::L
             let report = build_daily_report(state, &previous_day, "finalized", now);
             upsert_daily_report(state, report);
         }
+        archive_current_day_app_usage(state, &previous_day);
         upsert_current_embedding(state, now);
         reset_daily_activity(state);
         state.collection_day = today.clone();
@@ -1607,6 +1787,19 @@ fn clear_daily_report_history(state: tauri::State<'_, SharedState>, path: tauri:
     current.report_settings.work_mode_tag = None; current.report_settings.flow_satisfaction = None;
     save(&current, &storage_path(&path)?)?;
     Ok(())
+}
+
+#[tauri::command]
+fn get_app_usage_trend(period: String, state: tauri::State<'_, SharedState>) -> Result<AppUsageTrendView, String> {
+    let current = state.lock().map_err(|_| "state unavailable")?;
+    build_app_usage_trend(&current, &period)
+}
+
+#[tauri::command]
+fn clear_app_usage_history(state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<(), String> {
+    let mut current = state.lock().map_err(|_| "state unavailable")?;
+    current.daily_app_usage.clear();
+    save(&current, &storage_path(&path)?)
 }
 
 #[tauri::command]
@@ -2056,7 +2249,7 @@ pub fn run() {
         })
         .manage(state)
         .manage(path)
-        .invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_report, get_daily_report_history, set_daily_report_enabled, set_daily_work_mode_tag, set_flow_reflection, set_flow_reflection_enabled, clear_daily_report_history, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, exit_application, request_notification_access, request_per_app_network_collection])
+        .invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_report, get_daily_report_history, set_daily_report_enabled, set_daily_work_mode_tag, set_flow_reflection, set_flow_reflection_enabled, clear_daily_report_history, get_app_usage_trend, clear_app_usage_history, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, exit_application, request_notification_access, request_per_app_network_collection])
         .run(tauri::generate_context!())
         .expect("error while running FlowLens");
 }
@@ -2225,6 +2418,54 @@ mod daily_report_tests {
         let expected_minute = now.minute() / 30 * 30;
         let key = disk_bucket_key(now);
         assert!(key.contains(&format!("T{:02}:{expected_minute:02}:00", now.hour())));
+    }
+
+    #[test]
+    fn builds_weekly_app_usage_trend_with_previous_period_delta() {
+        let mut state = TrackingState::default();
+        state.collection_day = "2026-10-02".into();
+        state.apps = vec![
+            AppActivity { app: "editor.exe".into(), active_millis: 7_200_000, seconds: 7_200, activations: 5, ..Default::default() },
+            AppActivity { app: "browser.exe".into(), active_millis: 1_800_000, seconds: 1_800, activations: 2, ..Default::default() },
+        ];
+        for (date, editor_minutes, browser_minutes) in [
+            ("2026-09-26", 20u64, 5u64), ("2026-09-27", 30, 0), ("2026-09-29", 60, 20), ("2026-10-01", 90, 10),
+            ("2026-09-19", 15, 10), ("2026-09-22", 30, 0), ("2026-09-24", 45, 15),
+        ] {
+            state.daily_app_usage.push(DailyAppUsageRecord {
+                schema_version: 1, date: date.into(), apps: vec![
+                    DailyAppUsageEntry { app: "editor.exe".into(), active_millis: editor_minutes * 60_000, activations: 1 },
+                    DailyAppUsageEntry { app: "browser.exe".into(), active_millis: browser_minutes * 60_000, activations: 1 },
+                ],
+            });
+        }
+        let trend = build_app_usage_trend(&state, "week").unwrap();
+        assert_eq!(trend.days.len(), 7);
+        assert_eq!(trend.start_date, "2026-09-26");
+        assert_eq!(trend.end_date, "2026-10-02");
+        assert_eq!(trend.tracked_days, 5);
+        assert_eq!(trend.apps[0].app, "editor.exe");
+        assert_eq!(trend.apps[0].points.len(), 7);
+        assert!(trend.apps[0].total_active_millis > trend.apps[0].previous_total_active_millis);
+        assert!(trend.previous_tracked_days > 0);
+        let month = build_app_usage_trend(&state, "month").unwrap();
+        assert_eq!(month.days.len(), 30);
+        assert_eq!(month.start_date, "2026-09-03");
+        assert_eq!(month.end_date, "2026-10-02");
+    }
+
+    #[test]
+    fn retains_at_most_365_daily_app_usage_archives_without_titles() {
+        let mut state = TrackingState::default();
+        let start = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        for offset in 0..=365i64 {
+            let date = (start + chrono::Duration::days(offset)).to_string();
+            state.apps = vec![AppActivity { app: "editor.exe".into(), title: "private document title".into(), active_millis: 60_000, seconds: 60, activations: 1 }];
+            archive_current_day_app_usage(&mut state, &date);
+        }
+        assert_eq!(state.daily_app_usage.len(), MAX_DAILY_APP_USAGE_RECORDS);
+        assert_eq!(state.daily_app_usage.first().unwrap().date, "2025-01-02");
+        assert_eq!(state.daily_app_usage[0].apps[0].app, "editor.exe");
     }
 
     #[test]
