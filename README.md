@@ -34,6 +34,7 @@ Windows용 Tauri 기반 개인 생산성 분석 앱입니다. 사용자의 작�
 - 제목 없는 창·제목 변경·짧은 활성화 누락을 줄이는 앱 식별 방식과 검증 절차: `TRACKING_RELIABILITY.md`
 - 앱별 주간·월간 사용 시간 추이와 로컬 일별 보관 범위: `APP_USAGE_TRENDS.md`
 - 앱 카테고리·작업 전환 비용·개인 기준선·회복 리듬 분석: `WORK_PATTERN_ANALYSIS.md`
+- Windows 알림 수집·변화점 탐지·집중 세션 통계: `INSIGHTS_V012.md`
 
 ## 개인정보 보호 원칙
 

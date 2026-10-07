@@ -28,6 +28,8 @@ const EMBEDDING_DIMENSIONS: usize = 25;
 const FOREGROUND_SAMPLE_MS: u64 = 200;
 const DISK_SNAPSHOT_INTERVAL_SECS: i64 = 30 * 60;
 const MAX_DISK_SNAPSHOTS: usize = 51_840;
+const NOTIFICATION_POLL_SECS: u64 = 15;
+const MAX_NOTIFICATION_IDS: usize = 2_000;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -267,6 +269,67 @@ struct EmbeddingAnalysis {
     insights: Vec<PatternInsight>,
     last_workday_evaluation: Vec<String>,
     notice: String,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct SessionStatisticsView {
+    schema_version: u32,
+    observed_sessions: u16,
+    active_seconds: u64,
+    median_session_minutes: f32,
+    p90_session_minutes: f32,
+    longest_session_minutes: f32,
+    long_form_focus_share: f32,
+    short_session_share: f32,
+    median_break_minutes: Option<f32>,
+    first_session_latency_minutes: Option<f32>,
+    notice: String,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct ChangePointView {
+    metric: String,
+    label: String,
+    current_value: f32,
+    baseline_value: f32,
+    delta_percent: f32,
+    direction: String,
+    confidence: String,
+    evidence_days: u16,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct ChangePointAnalysisView {
+    schema_version: u32,
+    eligible: bool,
+    sample_days: u16,
+    points: Vec<ChangePointView>,
+    notice: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct NotificationDayBucket {
+    date: String,
+    hour: u8,
+    count: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct NotificationAppCount {
+    app: String,
+    count: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct NotificationLocalState {
+    observed_count: u64,
+    last_poll_at: Option<String>,
+    seen_ids: Vec<u32>,
+    daily_buckets: Vec<NotificationDayBucket>,
+    by_app: Vec<NotificationAppCount>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -559,6 +622,7 @@ struct TrackingState {
     network_rx_bytes: u64,
     network_tx_bytes: u64,
     notification_count: u64,
+    notification_local: NotificationLocalState,
     idle_seconds: u64,
     context_switches: u64,
     sessions: Vec<WorkSession>,
@@ -591,7 +655,7 @@ impl Default for TrackingState {
             timeline: Vec::new(), minute_snapshots: Vec::new(), flow_minutes: Vec::new(), active_app_count: 0,
             mouse_distance_px: 0.0, mouse_clicks: 0, mouse_wheel_notches: 0, disk_snapshots: Vec::new(), avg_click_interval_ms: 0,
             click_interval_count: 0, click_interval_mean_ms: 0.0, click_interval_m2: 0.0,
-            network_rx_bytes: 0, network_tx_bytes: 0, notification_count: 0, idle_seconds: 0,
+            network_rx_bytes: 0, network_tx_bytes: 0, notification_count: 0, notification_local: NotificationLocalState::default(), idle_seconds: 0,
             context_switches: 0, sessions: Vec::new(), current_session_started_at: None,
             current_session_active_seconds: 0, current_session_idle_seconds: 0,
             current_session_switches: 0, current_session_apps: Vec::new(),
@@ -776,6 +840,75 @@ fn build_app_usage_trend(state: &TrackingState, period: &str) -> Result<AppUsage
         total_active_millis, previous_total_active_millis, days, apps: series, notice,
     })
 }
+
+fn percentile_u64(values: &[u64], percentile: f64) -> Option<u64> {
+    if values.is_empty() { return None; }
+    let mut sorted = values.to_vec(); sorted.sort_unstable();
+    let index = ((sorted.len().saturating_sub(1) as f64) * percentile).round() as usize;
+    sorted.get(index.min(sorted.len().saturating_sub(1))).copied()
+}
+
+fn build_session_statistics(state: &TrackingState) -> SessionStatisticsView {
+    use chrono::Timelike;
+    let sessions: Vec<&WorkSession> = state.sessions.iter().filter(|item| item.active_seconds > 0).collect();
+    let mut values: Vec<u64> = sessions.iter().map(|item| item.active_seconds).collect();
+    if state.current_session_active_seconds > 0 { values.push(state.current_session_active_seconds); }
+    let total = values.iter().sum::<u64>();
+    let long = values.iter().filter(|value| **value >= 45 * 60).sum::<u64>();
+    let short = values.iter().filter(|value| **value < 10 * 60).count();
+    let mut breaks = Vec::new();
+    for pair in state.sessions.windows(2) {
+        if let (Some(left), Some(right)) = (parse_local_timestamp(pair[0].ended_at.as_deref().unwrap_or("")), parse_local_timestamp(&pair[1].started_at)) {
+            let gap = right.timestamp().saturating_sub(left.timestamp()); if gap >= 60 && gap <= 4 * 3600 { breaks.push(gap as u64); }
+        }
+    }
+    let first_latency = state.sessions.first().and_then(|item| parse_local_timestamp(&item.started_at)).map(|started| started.time().num_seconds_from_midnight() as f32 / 60.0);
+    SessionStatisticsView { schema_version: 1, observed_sessions: values.len().min(u16::MAX as usize) as u16, active_seconds: total, median_session_minutes: percentile_u64(&values, 0.50).unwrap_or(0) as f32 / 60.0, p90_session_minutes: percentile_u64(&values, 0.90).unwrap_or(0) as f32 / 60.0, longest_session_minutes: values.iter().copied().max().unwrap_or(0) as f32 / 60.0, long_form_focus_share: if total > 0 { long as f32 / total as f32 } else { 0.0 }, short_session_share: if values.is_empty() { 0.0 } else { short as f32 / values.len() as f32 }, median_break_minutes: median_f64(breaks.into_iter().map(|value| value as f64 / 60.0).collect()).map(|value| value as f32), first_session_latency_minutes: first_latency, notice: "세션 길이는 작업 구조를 설명하는 로컬 통계이며 성과·집중력·건강 상태를 판정하지 않습니다.".into() }
+}
+
+fn change_point(metric: &str, label: &str, current: f64, prior: &[f64], unit_scale: f64) -> Option<ChangePointView> {
+    if prior.len() < 7 { return None; }
+    let baseline = median_f64(prior.to_vec())?;
+    if baseline.abs() < 0.0001 { return None; }
+    let delta = (current - baseline) / baseline * 100.0;
+    if delta.abs() < 20.0 && (current - baseline).abs() < unit_scale { return None; }
+    Some(ChangePointView { metric: metric.into(), label: label.into(), current_value: current as f32, baseline_value: baseline as f32, delta_percent: delta as f32, direction: if delta >= 0.0 { "increased" } else { "decreased" }.into(), confidence: if prior.len() >= 14 { "moderate" } else { "early" }.into(), evidence_days: prior.len().min(u16::MAX as usize) as u16 })
+}
+
+fn build_change_point_analysis(state: &TrackingState) -> ChangePointAnalysisView {
+    let current = &state.daily_feature;
+    let prior: Vec<&DailyFeatureVector> = state.embedding_history.iter().filter(|record| record.date != current.date && record.feature.focus_minutes >= 15.0).map(|record| &record.feature).collect();
+    let mut points = Vec::new();
+    let metrics: [(&str, &str, f64, f64, fn(&DailyFeatureVector) -> f64); 4] = [
+        ("focus_minutes", "집중 시간", current.focus_minutes, 10.0, |item| item.focus_minutes),
+        ("switches_per_active_hour", "활성 1시간당 전환", current.switches_per_active_hour, 2.0, |item| item.switches_per_active_hour),
+        ("average_session_minutes", "평균 세션 길이", current.average_session_minutes, 5.0, |item| item.average_session_minutes),
+        ("active_ratio", "활성 비율", current.active_ratio, 0.10, |item| item.active_ratio),
+    ];
+    for (metric, label, value, scale, getter) in metrics { let values: Vec<f64> = prior.iter().map(|item| getter(item)).collect(); if let Some(point) = change_point(metric, label, value, &values, scale) { points.push(point); } }
+    points.sort_by(|left, right| right.delta_percent.abs().partial_cmp(&left.delta_percent.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    points.truncate(4);
+    ChangePointAnalysisView { schema_version: 1, eligible: prior.len() >= 7, sample_days: prior.len().min(u16::MAX as usize) as u16, points, notice: if prior.len() < 7 { "변화점은 최소 7개의 실제 업무일이 쌓인 뒤 표시됩니다. 14일 이상이면 더 안정적인 비교가 가능합니다.".into() } else { "변화점은 최근 업무일과 개인 기준선의 차이를 보여 주는 관찰값입니다. 원인이나 성과를 진단하지 않습니다.".into() } }
+}
+
+#[cfg(windows)]
+fn poll_windows_notifications(state: &mut TrackingState, now: chrono::DateTime<chrono::Local>) -> Result<(), String> {
+    use chrono::Timelike;
+    use windows::UI::Notifications::Management::{UserNotificationListener, UserNotificationListenerAccessStatus};
+    use windows::UI::Notifications::NotificationKinds;
+    let listener = UserNotificationListener::Current().map_err(|error| error.to_string())?;
+    let access = listener.GetAccessStatus().map_err(|error| error.to_string())?;
+    if access != UserNotificationListenerAccessStatus::Allowed { return Err("Windows 알림 접근 동의가 필요합니다. MSIX 패키지에서 설정을 확인하세요.".into()); }
+    let notifications = tauri::async_runtime::block_on(listener.GetNotificationsAsync(NotificationKinds::Toast)).map_err(|error| error.to_string())?;
+    let mut ids = Vec::with_capacity(notifications.Size().unwrap_or(0) as usize);
+    for index in 0..notifications.Size().unwrap_or(0) { if let Ok(item) = notifications.GetAt(index) { ids.push(item.Id().unwrap_or(0)); } }
+    let new_count = ids.iter().filter(|id| !state.notification_local.seen_ids.contains(id)).count() as u64;
+    if new_count > 0 { state.notification_count = state.notification_count.saturating_add(new_count); let bucket = NotificationDayBucket { date: now.date_naive().to_string(), hour: now.hour() as u8, count: new_count.min(u32::MAX as u64) as u32 }; if let Some(existing) = state.notification_local.daily_buckets.iter_mut().find(|item| item.date == bucket.date && item.hour == bucket.hour) { existing.count = existing.count.saturating_add(bucket.count); } else { state.notification_local.daily_buckets.push(bucket); } }
+    state.notification_local.seen_ids = ids; if state.notification_local.seen_ids.len() > MAX_NOTIFICATION_IDS { let start = state.notification_local.seen_ids.len() - MAX_NOTIFICATION_IDS; state.notification_local.seen_ids.drain(0..start); }
+    state.notification_local.observed_count = state.notification_count; state.notification_local.last_poll_at = Some(now.to_rfc3339()); Ok(())
+}
+#[cfg(not(windows))]
+fn poll_windows_notifications(_state: &mut TrackingState, _now: chrono::DateTime<chrono::Local>) -> Result<(), String> { Err("Windows에서만 알림 수집을 사용할 수 있습니다.".into()) }
 
 fn classify_app(app: &str) -> &'static str {
     let name = app.to_ascii_lowercase();
@@ -1943,6 +2076,33 @@ fn clear_app_usage_history(state: tauri::State<'_, SharedState>, path: tauri::St
 }
 
 #[tauri::command]
+fn get_session_statistics(state: tauri::State<'_, SharedState>) -> Result<SessionStatisticsView, String> { state.lock().map(|value| build_session_statistics(&value)).map_err(|_| "state unavailable".into()) }
+
+#[tauri::command]
+fn get_change_point_analysis(state: tauri::State<'_, SharedState>) -> Result<ChangePointAnalysisView, String> { state.lock().map(|value| build_change_point_analysis(&value)).map_err(|_| "state unavailable".into()) }
+
+#[tauri::command]
+fn collect_windows_notifications(state: tauri::State<'_, SharedState>, path: tauri::State<'_, SharedPath>) -> Result<AdvancedCollectionState, String> {
+    let mut current = state.lock().map_err(|_| "state unavailable")?;
+    current.advanced.notification_requested = true;
+    #[cfg(windows)]
+    if current.advanced.notification_access != "allowed_collecting" {
+        use windows::UI::Notifications::Management::{UserNotificationListener, UserNotificationListenerAccessStatus};
+        let listener = UserNotificationListener::Current().map_err(|error| error.to_string())?;
+        let access = listener.GetAccessStatus().map_err(|error| error.to_string())?;
+        if access != UserNotificationListenerAccessStatus::Allowed {
+            let requested = tauri::async_runtime::block_on(listener.RequestAccessAsync()).map_err(|error| error.to_string())?;
+            if requested == UserNotificationListenerAccessStatus::Allowed { current.advanced.notification_access = "consent_granted".into(); }
+        }
+    }
+    match poll_windows_notifications(&mut current, chrono::Local::now()) {
+        Ok(()) => { current.advanced.notification_access = "allowed_collecting".into(); current.advanced.helper_last_error.clear(); }
+        Err(error) => { current.advanced.notification_access = "access_required_or_unavailable".into(); current.advanced.helper_last_error = error; }
+    }
+    save(&current, &storage_path(&path)?)?; Ok(current.advanced.clone())
+}
+
+#[tauri::command]
 fn get_work_pattern_analysis(state: tauri::State<'_, SharedState>) -> Result<WorkPatternAnalysisView, String> {
     state.lock().map(|value| build_work_pattern_analysis(&value)).map_err(|_| "state unavailable".into())
 }
@@ -2187,6 +2347,7 @@ fn start_tracker(state: SharedState, path: SharedPath) {
         let mut last_minute = Local::now().minute();
         let mut previous_network = network_totals();
         let mut last_disk_bucket = String::new();
+        let mut last_notification_poll = Instant::now() - Duration::from_secs(NOTIFICATION_POLL_SECS);
         let input_clock = Arc::new(Mutex::new(Instant::now()));
         start_wheel_tracker(state.clone(), input_clock.clone());
         let mut process_cache: HashMap<u32, (String, bool)> = HashMap::new();
@@ -2327,6 +2488,14 @@ fn start_tracker(state: SharedState, path: SharedPath) {
                 }
                 last_disk_bucket = disk_bucket;
             }
+            if last_notification_poll.elapsed() >= Duration::from_secs(NOTIFICATION_POLL_SECS) {
+                if let Ok(mut current) = state.lock() {
+                    if current.advanced.notification_access == "allowed_collecting" {
+                        let _ = poll_windows_notifications(&mut current, now);
+                    }
+                }
+                last_notification_poll = Instant::now();
+            }
             if now.minute() != last_minute {
                 let network = network_totals();
                 let received_delta = network.0.saturating_sub(previous_network.0);
@@ -2394,7 +2563,7 @@ pub fn run() {
         })
         .manage(state)
         .manage(path)
-        .invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_report, get_daily_report_history, set_daily_report_enabled, set_daily_work_mode_tag, set_flow_reflection, set_flow_reflection_enabled, clear_daily_report_history, get_app_usage_trend, clear_app_usage_history, get_work_pattern_analysis, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, exit_application, request_notification_access, request_per_app_network_collection])
+        .invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_report, get_daily_report_history, set_daily_report_enabled, set_daily_work_mode_tag, set_flow_reflection, set_flow_reflection_enabled, clear_daily_report_history, get_app_usage_trend, clear_app_usage_history, get_session_statistics, get_change_point_analysis, collect_windows_notifications, get_work_pattern_analysis, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, exit_application, request_notification_access, request_per_app_network_collection])
         .run(tauri::generate_context!())
         .expect("error while running FlowLens");
 }
