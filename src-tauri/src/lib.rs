@@ -81,6 +81,67 @@ struct AppUsageTrendView {
     notice: String,
 }
 
+#[derive(Clone, Serialize, Default)]
+struct AppCategorySummary {
+    category: String,
+    active_millis: u64,
+    app_count: u16,
+    share: f32,
+    apps: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct TransitionSummary {
+    from_app: String,
+    to_app: String,
+    count: u16,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct SwitchingCostView {
+    total_switches: u64,
+    rapid_switches: u64,
+    rapid_switch_rate: f32,
+    average_dwell_seconds: f32,
+    estimated_cost_minutes: f32,
+    top_transitions: Vec<TransitionSummary>,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct PersonalBaselineView {
+    sample_days: u16,
+    focus_minutes: f32,
+    baseline_focus_minutes: Option<f32>,
+    focus_delta_minutes: Option<f32>,
+    switches_per_active_hour: f32,
+    baseline_switches_per_active_hour: Option<f32>,
+    switch_delta_per_hour: Option<f32>,
+    active_ratio: f32,
+    baseline_active_ratio: Option<f32>,
+    notice: String,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct RecoveryRhythmView {
+    longest_focus_minutes: f32,
+    current_focus_minutes: f32,
+    break_count: u16,
+    median_break_minutes: Option<f32>,
+    median_recovery_minutes: Option<f32>,
+    notice: String,
+}
+
+#[derive(Clone, Serialize, Default)]
+struct WorkPatternAnalysisView {
+    schema_version: u32,
+    generated_at: String,
+    categories: Vec<AppCategorySummary>,
+    switching: SwitchingCostView,
+    baseline: PersonalBaselineView,
+    recovery: RecoveryRhythmView,
+    notice: String,
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct TimelineEvent { at: String, app: String, title: String, kind: String }
@@ -714,6 +775,85 @@ fn build_app_usage_trend(state: &TrackingState, period: &str) -> Result<AppUsage
         tracked_days, previous_tracked_days, archive_days: state.daily_app_usage.len().min(u16::MAX as usize) as u16,
         total_active_millis, previous_total_active_millis, days, apps: series, notice,
     })
+}
+
+fn classify_app(app: &str) -> &'static str {
+    let name = app.to_ascii_lowercase();
+    if ["code", "devenv", "idea", "rider", "clion", "pycharm", "androidstudio", "xcode", "notepad", "vim", "emacs", "sublime", "cursor"].iter().any(|token| name.contains(token)) { "개발" }
+    else if ["winword", "excel", "powerpnt", "onenote", "acrobat", "notion", "obsidian", "wordpad", "writer"].iter().any(|token| name.contains(token)) { "문서" }
+    else if ["teams", "slack", "discord", "zoom", "outlook", "thunderbird", "kakaotalk", "messenger"].iter().any(|token| name.contains(token)) { "커뮤니케이션" }
+    else if ["chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "browser"].iter().any(|token| name.contains(token)) { "브라우저" }
+    else if ["spotify", "steam", "game", "discord", "netflix"].iter().any(|token| name.contains(token)) { "여가" }
+    else { "기타" }
+}
+
+fn build_category_summary(state: &TrackingState) -> Vec<AppCategorySummary> {
+    let mut grouped: HashMap<String, (u64, Vec<String>)> = HashMap::new();
+    for app in &state.apps {
+        let millis = app.active_millis.max(app.seconds.saturating_mul(1_000));
+        if millis == 0 || app.app.trim().is_empty() { continue; }
+        let category = classify_app(&app.app).to_string();
+        let entry = grouped.entry(category).or_insert((0, Vec::new()));
+        entry.0 = entry.0.saturating_add(millis);
+        if !entry.1.iter().any(|item| item == &app.app) { entry.1.push(app.app.clone()); }
+    }
+    let total = grouped.values().map(|value| value.0).sum::<u64>().max(1) as f32;
+    let mut result: Vec<AppCategorySummary> = grouped.into_iter().map(|(category, (active_millis, mut apps))| {
+        apps.sort();
+        AppCategorySummary { category, active_millis, app_count: apps.len().min(u16::MAX as usize) as u16, share: active_millis as f32 / total, apps }
+    }).collect();
+    result.sort_by(|left, right| right.active_millis.cmp(&left.active_millis).then_with(|| left.category.cmp(&right.category)));
+    result
+}
+
+fn build_switching_cost(state: &TrackingState) -> SwitchingCostView {
+    let mut events: Vec<&TimelineEvent> = state.timeline.iter().filter(|event| event.kind == "app_switch" && !event.app.is_empty()).collect();
+    events.sort_by(|left, right| left.at.cmp(&right.at));
+    let mut transitions: HashMap<(String, String), u64> = HashMap::new();
+    let mut rapid = 0u64;
+    let mut dwell_sum = 0u64;
+    let mut dwell_count = 0u64;
+    for pair in events.windows(2) {
+        if let (Some(previous), Some(current)) = (parse_local_timestamp(&pair[0].at), parse_local_timestamp(&pair[1].at)) {
+            let seconds = current.timestamp().saturating_sub(previous.timestamp());
+            if seconds <= 60 { rapid = rapid.saturating_add(1); }
+            if seconds > 0 && seconds <= 4 * 60 * 60 { dwell_sum = dwell_sum.saturating_add(seconds as u64); dwell_count = dwell_count.saturating_add(1); }
+        }
+        if pair[0].app != pair[1].app { *transitions.entry((pair[0].app.clone(), pair[1].app.clone())).or_insert(0) += 1; }
+    }
+    let mut top: Vec<TransitionSummary> = transitions.into_iter().map(|((from_app, to_app), count)| TransitionSummary { from_app, to_app, count: count.min(u16::MAX as u64) as u16 }).collect();
+    top.sort_by(|left, right| right.count.cmp(&left.count).then_with(|| left.from_app.cmp(&right.from_app)));
+    top.truncate(5);
+    let total = state.context_switches.max(events.len() as u64);
+    let rapid_rate = if total > 0 { rapid as f32 / total as f32 } else { 0.0 };
+    SwitchingCostView { total_switches: total, rapid_switches: rapid, rapid_switch_rate: rapid_rate, average_dwell_seconds: if dwell_count > 0 { dwell_sum as f32 / dwell_count as f32 } else { 0.0 }, estimated_cost_minutes: rapid as f32 * 0.5, top_transitions: top }
+}
+
+fn build_personal_baseline(state: &TrackingState) -> PersonalBaselineView {
+    let current = &state.daily_feature;
+    let prior: Vec<&DailyFeatureVector> = state.embedding_history.iter().filter(|record| record.date != current.date && record.feature.focus_minutes >= 15.0).map(|record| &record.feature).collect();
+    if prior.is_empty() { return PersonalBaselineView { sample_days: 0, focus_minutes: current.focus_minutes as f32, switches_per_active_hour: current.switches_per_active_hour as f32, active_ratio: current.active_ratio as f32, notice: "이전 업무일이 1일 이상 쌓이면 개인 기준선과 비교합니다. 다른 사용자와 비교하지 않습니다.".into(), ..Default::default() }; }
+    let avg_focus = prior.iter().map(|item| item.focus_minutes).sum::<f64>() / prior.len() as f64;
+    let avg_switch = prior.iter().map(|item| item.switches_per_active_hour).sum::<f64>() / prior.len() as f64;
+    let avg_ratio = prior.iter().map(|item| item.active_ratio).sum::<f64>() / prior.len() as f64;
+    PersonalBaselineView { sample_days: prior.len().min(u16::MAX as usize) as u16, focus_minutes: current.focus_minutes as f32, baseline_focus_minutes: Some(avg_focus as f32), focus_delta_minutes: Some((current.focus_minutes - avg_focus) as f32), switches_per_active_hour: current.switches_per_active_hour as f32, baseline_switches_per_active_hour: Some(avg_switch as f32), switch_delta_per_hour: Some((current.switches_per_active_hour - avg_switch) as f32), active_ratio: current.active_ratio as f32, baseline_active_ratio: Some(avg_ratio as f32), notice: "개인 기준선은 최근 로컬 업무일의 중앙 경향을 참고한 비교용 지표입니다. 성과나 건강을 판정하지 않습니다.".into() }
+}
+
+fn build_recovery_rhythm(state: &TrackingState) -> RecoveryRhythmView {
+    let mut longest = 0u64;
+    let mut current_streak = 0u64;
+    for minute in flow_minutes_for_date(state, &state.collection_day) {
+        let focused = minute.observed_seconds >= 30 && minute.focus_seconds as f32 / minute.observed_seconds.max(1) as f32 >= 0.75 && minute.switch_count <= 1;
+        if focused { current_streak = current_streak.saturating_add(minute.focus_seconds as u64); longest = longest.max(current_streak); } else { current_streak = 0; }
+    }
+    let episodes: Vec<&ReentryEpisode> = state.reentry_episodes.iter().filter(|episode| episode.finalized).collect();
+    let breaks: Vec<f64> = episodes.iter().map(|episode| episode.break_seconds as f64 / 60.0).collect();
+    let recoveries: Vec<f64> = episodes.iter().filter_map(|episode| episode.stabilization_seconds.map(|value| value as f64 / 60.0)).collect();
+    RecoveryRhythmView { longest_focus_minutes: longest as f32 / 60.0, current_focus_minutes: current_streak as f32 / 60.0, break_count: breaks.len().min(u16::MAX as usize) as u16, median_break_minutes: median_f64(breaks).map(|value| value as f32), median_recovery_minutes: median_f64(recoveries).map(|value| value as f32), notice: "휴식 횟수와 재개 후 안정화 시간만 표시합니다. 피로·건강 상태를 진단하지 않습니다.".into() }
+}
+
+fn build_work_pattern_analysis(state: &TrackingState) -> WorkPatternAnalysisView {
+    WorkPatternAnalysisView { schema_version: 1, generated_at: chrono::Local::now().to_rfc3339(), categories: build_category_summary(state), switching: build_switching_cost(state), baseline: build_personal_baseline(state), recovery: build_recovery_rhythm(state), notice: "모든 분석은 이 기기의 집계 데이터로만 계산됩니다. 카테고리는 실행 파일명 기반의 보수적 추정이며 사용자가 업무 성격을 확인해야 합니다.".into() }
 }
 
 fn flow_minute_key(now: chrono::DateTime<chrono::Local>) -> String {
@@ -1803,6 +1943,11 @@ fn clear_app_usage_history(state: tauri::State<'_, SharedState>, path: tauri::St
 }
 
 #[tauri::command]
+fn get_work_pattern_analysis(state: tauri::State<'_, SharedState>) -> Result<WorkPatternAnalysisView, String> {
+    state.lock().map(|value| build_work_pattern_analysis(&value)).map_err(|_| "state unavailable".into())
+}
+
+#[tauri::command]
 fn get_daily_feature_vector(state: tauri::State<'_, SharedState>) -> Result<DailyFeatureVector, String> { state.lock().map(|value| value.daily_feature.clone()).map_err(|_| "state unavailable".into()) }
 #[tauri::command]
 fn get_embedding_analysis(state: tauri::State<'_, SharedState>) -> Result<EmbeddingAnalysis, String> { state.lock().map(|value| analyze_embedding(&value)).map_err(|_| "state unavailable".into()) }
@@ -2249,7 +2394,7 @@ pub fn run() {
         })
         .manage(state)
         .manage(path)
-        .invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_report, get_daily_report_history, set_daily_report_enabled, set_daily_work_mode_tag, set_flow_reflection, set_flow_reflection_enabled, clear_daily_report_history, get_app_usage_trend, clear_app_usage_history, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, exit_application, request_notification_access, request_per_app_network_collection])
+        .invoke_handler(tauri::generate_handler![set_tracking, get_tracking_state, get_focus_experience_view, get_daily_report, get_daily_report_history, set_daily_report_enabled, set_daily_work_mode_tag, set_flow_reflection, set_flow_reflection_enabled, clear_daily_report_history, get_app_usage_trend, clear_app_usage_history, get_work_pattern_analysis, get_daily_feature_vector, get_embedding_analysis, set_embedding_enabled, clear_embedding_data, clear_all_data, exit_application, request_notification_access, request_per_app_network_collection])
         .run(tauri::generate_context!())
         .expect("error while running FlowLens");
 }
@@ -2418,6 +2563,38 @@ mod daily_report_tests {
         let expected_minute = now.minute() / 30 * 30;
         let key = disk_bucket_key(now);
         assert!(key.contains(&format!("T{:02}:{expected_minute:02}:00", now.hour())));
+    }
+
+    #[test]
+    fn groups_apps_and_estimates_switching_cost_locally() {
+        let mut state = TrackingState::default();
+        state.collection_day = "2026-10-07".into();
+        state.apps = vec![
+            AppActivity { app: "code.exe".into(), active_millis: 3_600_000, seconds: 3_600, ..Default::default() },
+            AppActivity { app: "chrome.exe".into(), active_millis: 1_800_000, seconds: 1_800, ..Default::default() },
+            AppActivity { app: "Teams.exe".into(), active_millis: 600_000, seconds: 600, ..Default::default() },
+        ];
+        state.timeline = vec![
+            TimelineEvent { at: "2026-10-07T09:00:00+09:00".into(), app: "code.exe".into(), ..Default::default() },
+            TimelineEvent { at: "2026-10-07T09:00:30+09:00".into(), app: "chrome.exe".into(), kind: "app_switch".into(), ..Default::default() },
+            TimelineEvent { at: "2026-10-07T09:01:00+09:00".into(), app: "code.exe".into(), kind: "app_switch".into(), ..Default::default() },
+        ];
+        state.context_switches = 2;
+        let view = build_work_pattern_analysis(&state);
+        assert_eq!(view.categories[0].category, "개발");
+        assert_eq!(view.switching.rapid_switches, 1);
+        assert!(!view.switching.top_transitions.is_empty());
+    }
+
+    #[test]
+    fn personal_baseline_uses_prior_local_embedding_days() {
+        let mut state = TrackingState::default();
+        state.daily_feature = DailyFeatureVector { date: "2026-10-07".into(), focus_minutes: 60.0, active_ratio: 0.8, switches_per_active_hour: 5.0, ..Default::default() };
+        state.embedding_history.push(EmbeddingRecord { date: "2026-10-06".into(), feature: DailyFeatureVector { focus_minutes: 40.0, active_ratio: 0.6, switches_per_active_hour: 8.0, ..Default::default() }, ..Default::default() });
+        let baseline = build_personal_baseline(&state);
+        assert_eq!(baseline.sample_days, 1);
+        assert_eq!(baseline.focus_delta_minutes, Some(20.0));
+        assert_eq!(baseline.switch_delta_per_hour, Some(-3.0));
     }
 
     #[test]
