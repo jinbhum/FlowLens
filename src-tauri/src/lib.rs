@@ -899,7 +899,7 @@ fn poll_windows_notifications(state: &mut TrackingState, now: chrono::DateTime<c
     let listener = UserNotificationListener::Current().map_err(|error| error.to_string())?;
     let access = listener.GetAccessStatus().map_err(|error| error.to_string())?;
     if access != UserNotificationListenerAccessStatus::Allowed { return Err("Windows 알림 접근 동의가 필요합니다. MSIX 패키지에서 설정을 확인하세요.".into()); }
-    let notifications = tauri::async_runtime::block_on(listener.GetNotificationsAsync(NotificationKinds::Toast)).map_err(|error| error.to_string())?;
+    let notifications = listener.GetNotificationsAsync(NotificationKinds::Toast).map_err(|error| error.to_string())?.get().map_err(|error| error.to_string())?;
     let mut ids = Vec::with_capacity(notifications.Size().unwrap_or(0) as usize);
     for index in 0..notifications.Size().unwrap_or(0) { if let Ok(item) = notifications.GetAt(index) { ids.push(item.Id().unwrap_or(0)); } }
     let new_count = ids.iter().filter(|id| !state.notification_local.seen_ids.contains(id)).count() as u64;
@@ -2091,7 +2091,7 @@ fn collect_windows_notifications(state: tauri::State<'_, SharedState>, path: tau
         let listener = UserNotificationListener::Current().map_err(|error| error.to_string())?;
         let access = listener.GetAccessStatus().map_err(|error| error.to_string())?;
         if access != UserNotificationListenerAccessStatus::Allowed {
-            let requested = tauri::async_runtime::block_on(listener.RequestAccessAsync()).map_err(|error| error.to_string())?;
+            let requested = listener.RequestAccessAsync().map_err(|error| error.to_string())?.get().map_err(|error| error.to_string())?;
             if requested == UserNotificationListenerAccessStatus::Allowed { current.advanced.notification_access = "consent_granted".into(); }
         }
     }
